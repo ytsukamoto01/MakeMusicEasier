@@ -1,7 +1,47 @@
 import streamlit as st
+import numpy as np
 from pdf2image import convert_from_bytes
-from PIL import ImageDraw, ImageFont
-import io
+from PIL import ImageDraw, ImageFont, Image
+import io, cv2
+
+def detect_staff_lines(pil_img):
+    # 1. PIL画像(Pillow)をOpenCVで扱える形式(NumPy配列)に変換
+    img_array = np.array(pil_img)
+    
+    # 2. グレースケール（白黒）に変換
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+
+    # 3. 二値化（白黒をはっきりさせ、色を反転する。線＝白、背景＝黒にするため）
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # 4. 横線を抽出するための「横長のフィルター」を作成
+    # 画像の幅の1/40くらいの長さを基準にします
+    width = thresh.shape[1]
+    kernel_len = width // 40
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+
+    # 5. モルフォロジー変換（横線だけを残す画像処理の魔法）
+    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+
+    # -- ここからは画面確認用（元の画像に赤線を引く） --
+    # 線の塊（輪郭）を見つける
+    contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 結果を描き込む用の画像（カラー）を用意
+    result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    
+    # 見つけた線の上に赤い線を引く
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        # 幅が短すぎるものは「五線ではない」として除外（ノイズ除去）
+        if w > width // 4: 
+            cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2) # 赤枠を描画
+
+    # OpenCVの画像をPIL画像に戻して返す
+    return Image.fromarray(result_img)
 
 # ページの設定
 st.set_page_config(page_title="ドレミ自動付与ツール", layout="centered")
@@ -22,28 +62,18 @@ if uploaded_file is not None:
     for i, image in enumerate(images):
         st.image(image, caption=f"{i+1}ページ目", use_column_width=True)
 
-# 3. 画像への書き込み処理 (Pillowを使用)
-    with st.spinner('ドレミを書き込み中...'):
+# 3. 画像への書き込み処理
+    with st.spinner('五線を検出中...'):
         processed_images = []
         
-        # 変更点：アップロードした日本語フォントを読み込む
-        # 第2引数の「32」は文字のサイズです。お好みで変更してください。
-        try:
-            font = ImageFont.truetype("NotoSansJP-Regular.ttf", 32) 
-        except IOError:
-            st.error("フォントファイル(font.ttf)が見つかりません。デフォルトフォントを使用します。")
-            font = ImageFont.load_default()
-
         for i, img in enumerate(images):
-            draw = ImageDraw.Draw(img)
+            # さっき作ったOpenCVの関数で五線を検出！
+            result_img = detect_staff_lines(img)
             
-            # 【変更点】日本語で「ド」「レ」を書き込む
-            draw.text((100, 100), "ド", font=font, fill=(255, 0, 0)) 
-            draw.text((200, 150), "レ", font=font, fill=(255, 0, 0)) 
+            processed_images.append(result_img)
             
-            processed_images.append(img)
-            
-            st.image(img, caption=f"{i+1}ページ目 (処理後)", use_column_width=True)
+            # 結果を画面にプレビュー表示
+            st.image(result_img, caption=f"{i+1}ページ目 (五線検出後)", use_column_width=True)
 
     st.success("処理が完了しました！")
 
