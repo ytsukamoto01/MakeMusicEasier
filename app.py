@@ -248,8 +248,6 @@ def analyze_score_v2(pil_img, user_threshold):
     margin = staff_space * 8 
     
     for box in picked_boxes:
-        if box[0] < ignore_x_zone:
-            continue
             
         note_center_y = int((box[1] + box[3]) / 2)
         distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
