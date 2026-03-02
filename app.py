@@ -5,47 +5,34 @@ from PIL import ImageDraw, ImageFont, Image
 import io, cv2
 
 def detect_staff_lines(pil_img):
-    # 1. PIL画像(Pillow)をOpenCVで扱える形式(NumPy配列)に変換
     img_array = np.array(pil_img)
-    
-    # 2. グレースケール（白黒）に変換
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
 
-    # 3. 二値化（白黒をはっきりさせ、色を反転する。線＝白、背景＝黒にするため）
+    # 1. 二値化（文字や線を白=255、背景を黒=0に反転）
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-    # 4. 横線を抽出するための「横長のフィルター」を作成
-    # 画像の幅の1/40くらいの長さを基準にします
+    # 2. 水平投影：各行（横方向）の白ピクセル(255)の合計を計算
+    # これにより、Y座標ごとの「線の密集度」のグラフが作られます
+    horizontal_sum = np.sum(thresh, axis=1)
+
+    # 3. 閾値（しきいち）の設定：画像の横幅の「何％」が直線なら五線とみなすか
     width = thresh.shape[1]
-    kernel_len = width // 40
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+    # 例：横幅の50%以上が黒（255）で埋まっている行を探す
+    threshold_value = width * 255 * 0.5 
 
-    # 5. モルフォロジー変換（横線だけを残す画像処理の魔法）
-    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+    # 4. 閾値を超えたY座標（行）をすべて取得
+    y_coordinates = np.where(horizontal_sum > threshold_value)[0]
 
-    # -- ここからは画面確認用（元の画像に赤線を引く） --
-    # 線の塊（輪郭）を見つける
-    contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # 結果を描き込む用の画像（カラー）を用意
+    # -- 画面確認用（元の画像に赤線を引く） --
     result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    
-# 見つけた線の上に赤い線を引く
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        
-        # 輪郭の面積（ピクセル数）を取得
-        area = cv2.contourArea(contour)
-        
-        # 横幅が十分に長く、かつ「平均の太さ (面積 ÷ 横幅)」が細いものだけを残す
-        # ※ 5 の部分は線の太さに合わせて微調整してください（大抵は 2〜5 くらいで収まります）
-        if w > width // 4 and (area / w) < 5: 
-            cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2) # 赤枠を描画
 
-    # OpenCVの画像をPIL画像に戻して返す
+    # 見つけたY座標に、端から端まで赤い横線を引く
+    for y in y_coordinates:
+        cv2.line(result_img, (0, y), (width, y), (255, 0, 0), 1)
+
     return Image.fromarray(result_img)
 
 # ページの設定
