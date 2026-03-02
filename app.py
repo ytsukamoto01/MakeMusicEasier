@@ -35,6 +35,52 @@ def detect_staff_lines(pil_img):
 
     return Image.fromarray(result_img)
 
+
+def detect_note_heads(pil_img):
+    img_array = np.array(pil_img)
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+
+    # 1. 二値化（文字や線を白=255、背景を黒=0にする）
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # ---------------------------------------------------------
+    # 2. 探すための「おたまじゃくしの型（テンプレート）」を作る
+    # ※ここが一番の調整ポイントです！画像の大きさに合わせて変える必要があります
+    # ---------------------------------------------------------
+    template_w = 24  # 楕円の横幅
+    template_h = 16  # 楕円の縦幅
+    
+    # 真っ黒なキャンバスを作る
+    template = np.zeros((template_h + 10, template_w + 10), dtype=np.uint8)
+    
+    # キャンバスの中央に、少し斜め（-20度）に傾けた楕円（おたまじゃくし）を描く
+    center = ((template_w + 10) // 2, (template_h + 10) // 2)
+    axes = (template_w // 2, template_h // 2)
+    cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
+
+    # 3. テンプレートマッチングの実行（そっくり度を計算）
+    result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
+
+    # 4. 閾値（しきいち）：どれくらい似ていたら「音符だ！」と認めるか（0.0〜1.0）
+    # 厳しすぎると見逃し、緩すぎると文字なども拾ってしまいます
+    threshold_value = 0.65 
+    
+    # 似ている場所の座標を取得
+    locations = np.where(result >= threshold_value)
+
+    # -- 画面確認用（元の画像に緑色の枠を描く） --
+    result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    h, w = template.shape
+
+    # 見つけた場所に緑色の四角を描画
+    for pt in zip(*locations[::-1]): # 座標を(x, y)の順に変換
+        cv2.rectangle(result_img, pt, (pt[0] + w, pt[1] + h), (0, 255, 0), 2)
+
+    return Image.fromarray(result_img)
+
 # ページの設定
 st.set_page_config(page_title="ドレミ自動付与ツール", layout="centered")
 
