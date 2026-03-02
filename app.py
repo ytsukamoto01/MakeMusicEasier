@@ -33,11 +33,15 @@ def detect_staff_lines(pil_img):
     # 結果を描き込む用の画像（カラー）を用意
     result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     
-    # 見つけた線の上に赤い線を引く
+# 見つけた線の上に赤い線を引く
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        # 幅が短すぎるものは「五線ではない」として除外（ノイズ除去）
-        if w > width // 4: 
+        
+        # 【修正】幅(w)が長く、かつ 高さ(h)が低い（＝まっすぐな細い線）ものだけを残す
+        # ※ h < 15 の数字は画像の解像度によって調整が必要な場合があります。
+        # 厳しすぎる（線が消える）場合は 20 や 30 に、
+        # 緩すぎる（スラーが残る）場合は 10 や 5 に変更してみてください。
+        if w > width // 4 and h < 15: 
             cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2) # 赤枠を描画
 
     # OpenCVの画像をPIL画像に戻して返す
