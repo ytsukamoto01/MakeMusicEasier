@@ -140,7 +140,7 @@ def analyze_score(pil_img, template_w, template_h, threshold):
     result_pil = Image.fromarray(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
     draw = ImageDraw.Draw(result_pil)
     try:
-        font = ImageFont.truetype("font.ttf", max(16, template_h))
+        font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(16, template_h))
     except IOError:
         font = ImageFont.load_default()
 
