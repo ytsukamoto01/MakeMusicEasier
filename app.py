@@ -42,7 +42,7 @@ def detect_staff_lines(pil_img):
         
         # 横幅が十分に長く、かつ「平均の太さ (面積 ÷ 横幅)」が細いものだけを残す
         # ※ 5 の部分は線の太さに合わせて微調整してください（大抵は 2〜5 くらいで収まります）
-        if w > width // 4 and (area / w) < 1: 
+        if w > width // 4 and (area / w) < 5: 
             cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2) # 赤枠を描画
 
     # OpenCVの画像をPIL画像に戻して返す
