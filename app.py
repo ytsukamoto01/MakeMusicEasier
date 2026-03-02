@@ -110,20 +110,22 @@ def non_max_suppression(boxes, overlapThresh):
     return boxes[pick].astype("int")
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
-    """密度フィルターを追加し、スカスカなノイズ（♭や休符）を排除する"""
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    k_size = max(2, int(staff_space * 0.55)) 
+    # 削りすぎないよう少し優しめに設定
+    k_size = max(2, int(staff_space * 0.45)) 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
     note_w = int(staff_space * 1.2)
     note_h = int(staff_space * 0.9)
     
+    # 【大バグ修正！】パッド（余白）のズレを修正
+    pad = 5
     template_w = note_w
     template_h = note_h
-    template = np.zeros((template_h + 10, template_w + 10), dtype=np.uint8)
-    center = ((template_w + 10) // 2, (template_h + 10) // 2)
+    template = np.zeros((template_h + pad*2, template_w + pad*2), dtype=np.uint8)
+    center = (template_w // 2 + pad, template_h // 2 + pad)
     axes = (template_w // 2, template_h // 2)
     cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
@@ -132,7 +134,10 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 
     rectangles = []
     for pt in zip(*locations[::-1]):
-        rect_data = [int(pt[0]), int(pt[1]), int(pt[0] + template_w), int(pt[1] + template_h)]
+        # 余白(pad)の分だけ座標を補正し、純粋な音符だけを囲む！
+        x1 = int(pt[0] + pad)
+        y1 = int(pt[1] + pad)
+        rect_data = [x1, y1, x1 + template_w, y1 + template_h]
         rectangles.append(rect_data)
 
     if not rectangles:
@@ -141,19 +146,15 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     boxes = np.array(rectangles)
     picked_boxes = non_max_suppression(boxes, overlapThresh=0.3)
 
-    # 【最強の追加武器：密度フィルター】
     final_boxes = []
     for (x1, y1, x2, y2) in picked_boxes:
-        # 枠内の画像を切り出す（元の二値化画像を使う）
         roi = thresh[y1:y2, x1:x2]
         if roi.size == 0: continue
         
-        # 枠内の「白ピクセル（元の黒インク）」の割合を計算
         fill_ratio = np.count_nonzero(roi) / roi.size
         
-        # 枠の半分以上が塗りつぶされている（本物の音符）ものだけを残す！
-        # ※もし本物の音符まで消える場合は 0.50 を 0.40 などに下げてください
-        if fill_ratio > 0.50:
+        # 【新フィルター】スカスカなノイズ(40%未満)と、真っ黒な連桁(90%以上)の両方をカット！
+        if 0.40 < fill_ratio < 0.90:
             final_boxes.append([x1, y1, x2, y2])
 
     return final_boxes
@@ -193,8 +194,6 @@ def calculate_pitch(note_center_y, staves, clefs):
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
-    """高精度版解析関数（ノイズ完全シャットアウト版）"""
-    
     deskewed_pil = deskew(pil_img)
     staff_y_coords, gray_img = detect_staff_lines_precise(deskewed_pil)
     
@@ -204,15 +203,27 @@ def analyze_score_v2(pil_img, user_threshold):
     staff_space = np.median(np.diff(staff_y_coords))
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
+    # 【大革命】どんなにノイズ線が混じっていても、完璧な5本線の組み合わせだけを抽出し続ける探索ロジック
     staves = []
-    i = 0
-    while i <= len(staff_y_coords) - 5:
-        height = staff_y_coords[i+4] - staff_y_coords[i]
-        if staff_space * 3 < height < staff_space * 5: 
-            staves.append(staff_y_coords[i:i+5])
-            i += 5 
-        else:
-            i += 1
+    for i in range(len(staff_y_coords)):
+        y1 = staff_y_coords[i]
+        # すでに登録済みの段と被る場合はスキップ
+        if staves and y1 < staves[-1][4] + staff_space * 2:
+            continue
+        
+        current_staff = [y1]
+        last_y = y1
+        for j in range(i+1, len(staff_y_coords)):
+            yj = staff_y_coords[j]
+            # 次の線が、五線間隔の許容範囲内なら追加（ノイズ線は無視される）
+            if staff_space * 0.6 < (yj - last_y) < staff_space * 1.4:
+                current_staff.append(yj)
+                last_y = yj
+            if len(current_staff) == 5:
+                break
+        
+        if len(current_staff) == 5:
+            staves.append(current_staff)
             
     if not staves:
         return deskewed_pil
@@ -230,14 +241,21 @@ def analyze_score_v2(pil_img, user_threshold):
         font = ImageFont.load_default()
 
     staff_notes = {i: [] for i in range(len(staves))}
-    margin = staff_space * 7 # 五線から約7加線分までを「音符が存在できる限界」とする
+    
+    # 【修正】ショパンの超高音に対応するため、マージンをさらに拡大（8加線分まで許可）
+    margin = staff_space * 8 
+    
+    img_width = deskewed_pil.size[0]
+    ignore_x_zone = int(img_width * 0.08)
     
     for box in picked_boxes:
+        if box[0] < ignore_x_zone:
+            continue
+            
         note_center_y = int((box[1] + box[3]) / 2)
         distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
         closest_idx = int(np.argmin(distances))
         
-        # 【新ルール】五線から遠すぎるノイズ（ペダル記号・タイトルなど）は強制的に捨てる！
         closest_staff = staves[closest_idx]
         if (closest_staff[0] - margin) <= note_center_y <= (closest_staff[4] + margin):
             staff_notes[closest_idx].append(box)
@@ -253,8 +271,7 @@ def analyze_score_v2(pil_img, user_threshold):
             if not current_chord:
                 current_chord.append(box)
             else:
-                # 【新ルール】右手の速いメロディが和音と勘違いされないよう、横幅のズレ判定をさらに厳格化（0.5倍）
-                if abs(box[0] - current_chord[-1][0]) < (staff_space * 0.5):
+                if abs(box[0] - current_chord[-1][0]) < (staff_space * 0.6):
                     current_chord.append(box)
                 else:
                     chords.append(current_chord)
@@ -270,7 +287,6 @@ def analyze_score_v2(pil_img, user_threshold):
                 doremi = calculate_pitch(note_center_y, staves, clefs)
                 if doremi:
                     pitches.append(doremi)
-                    # 枠を描画（確認用：緑色）
                     draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
             
             if pitches:
