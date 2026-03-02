@@ -12,23 +12,18 @@ from pdf2image import convert_from_bytes
 def get_staff_lines_by_projection(pil_img):
     """
     水平投影を使用して五線を検出する。
-    連桁（ビーム）やスラーを排除し、正確に5本1組の線を見つける。
     """
     img_array = np.array(pil_img.convert('L'))
-    # 二値化（白背景を黒、線を白に）
     _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 横方向の画素の合計（投影）を計算
     projection = np.sum(thresh, axis=1)
     
-    # ピーク（線がある場所）を探す
     line_candidates = []
     thresh_val = np.max(projection) * 0.5
     for i in range(1, len(projection) - 1):
         if projection[i] > thresh_val and projection[i] >= projection[i-1] and projection[i] >= projection[i+1]:
             line_candidates.append(i)
 
-    # 近すぎるピーク（同じ線の上下縁など）を統合
     merged_lines = []
     if line_candidates:
         curr = line_candidates[0]
@@ -40,15 +35,13 @@ def get_staff_lines_by_projection(pil_img):
                 curr = line_candidates[i]
         merged_lines.append(curr)
 
-    # 5本1組のグループに分ける（五線の塊を特定）
     staves = []
     i = 0
     while i <= len(merged_lines) - 5:
         diffs = np.diff(merged_lines[i:i+5])
         avg_spacing = np.mean(diffs)
-        # 5本の線の間隔が概ね均等であることを確認
         if np.all(np.abs(diffs - avg_spacing) < avg_spacing * 0.4):
-            # [第1線, 第2線, 第3線, 第4線, 第5線] (下から上)の順で保存
+            # [第1線, 第2線, 第3線, 第4線, 第5線] (下から上)
             staves.append(sorted(merged_lines[i:i+5], reverse=True))
             i += 5
         else:
@@ -79,7 +72,6 @@ def non_max_suppression_fast(boxes, overlapThresh):
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # 音符の頭のサイズに合わせたカーネル
     k_size = max(2, int(staff_space * 0.5)) 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
@@ -100,28 +92,18 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 # ==========================================
 
 def get_pitch_info_v3(note_y, staff_lines, clef, flats_count):
-    """
-    staff_lines[0] が一番下の線（第1線）
-    """
     bottom_line = staff_lines[0]
     top_line = staff_lines[4]
-    
-    # 1ステップ（線一つ分、または間一つ分）の距離
-    step_size = abs(top_line - bottom_line) / 4.0 / 2.0
-    
-    # 第1線（下から1番目）からのステップ数（上方向はマイナス座標なので引く）
+    step_size = abs(top_line - bottom_line) / 8.0
     steps_from_bottom = round((bottom_line - note_y) / step_size)
 
-    # 音名マッピング (0 = 第1線)
     if clef == "treble":
-        # -2:ド, -1:レ, 0:ミ, 1:ファ, 2:ソ, 3:ラ, 4:シ, 5:ド, 6:レ, 7:ミ, 8:ファ, 9:ソ, 10:ラ
         mapping = {
             -4:"ラ", -3:"シ", -2:"ド", -1:"レ", 
             0:"ミ", 1:"ファ", 2:"ソ", 3:"ラ", 4:"シ", 5:"ド", 6:"レ", 7:"ミ", 8:"ファ",
             9:"ソ", 10:"ラ", 11:"シ", 12:"ド"
         }
-    else: # bass (ヘ音記号)
-        # 0:ソ, 1:ラ, 2:シ, 3:ド, 4:レ, 5:ミ, 6:ファ, 7:ソ, 8:ラ
+    else: # bass
         mapping = {
             -2:"ミ", -1:"ファ",
             0:"ソ", 1:"ラ", 2:"シ", 3:"ド", 4:"レ", 5:"ミ", 6:"ファ", 7:"ソ", 8:"ラ",
@@ -131,7 +113,6 @@ def get_pitch_info_v3(note_y, staff_lines, clef, flats_count):
     base_name = mapping.get(steps_from_bottom, "")
     if not base_name: return "", False
 
-    # 調号（♭）の適用
     flat_order = ["シ", "ミ", "ラ", "レ", "ソ", "ド", "ファ"]
     is_flat = base_name in flat_order[:flats_count]
     
@@ -142,7 +123,6 @@ def get_pitch_info_v3(note_y, staff_lines, clef, flats_count):
 # ==========================================
 
 def analyze_score_final_v3(pil_img, threshold, flats_count):
-    # 五線検出（投影法）
     staves, space = get_staff_lines_by_projection(pil_img)
     if not staves: return pil_img
 
@@ -152,25 +132,24 @@ def analyze_score_final_v3(pil_img, threshold, flats_count):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
     
-    # フォント設定
     try: font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(14, int(space)))
     except: font = ImageFont.load_default()
 
     for box in notes:
-        yc = (box[1] + box[3]) // 2
+        # 【重要】box (numpy配列) をリスト形式に変換してエラーを回避
+        box_list = box.tolist()
         
-        # 最も近い五線グループを特定
+        yc = (box_list[1] + box_list[3]) // 2
         s_idx = np.argmin([abs(np.mean(s) - yc) for s in staves])
-        
-        # 段落内の上側（偶数番目の五線）をト音、下側（奇数番目）をヘ音と仮定
         clef = "treble" if s_idx % 2 == 0 else "bass"
         
         p_name, is_flat = get_pitch_info_v3(yc, staves[s_idx], clef, flats_count)
         
         if p_name:
-            draw.rectangle(box, outline=(0, 255, 0), width=2)
+            # box_list を使用して描画
+            draw.rectangle(box_list, outline=(0, 255, 0), width=2)
             text_color = (0, 0, 255) if is_flat else (255, 0, 0)
-            draw.text((box[0], box[1] - int(space * 1.5)), p_name, font=font, fill=text_color)
+            draw.text((box_list[0], box_list[1] - int(space * 1.5)), p_name, font=font, fill=text_color)
 
     return result
 
@@ -178,18 +157,18 @@ def analyze_score_final_v3(pil_img, threshold, flats_count):
 # 4. Streamlit UI
 # ==========================================
 
-st.set_page_config(page_title="ドレミ付与ツール V3", layout="centered")
-st.title("🎼 楽譜ドレミ付与ツール V3")
-st.write("五線検出を改善し、連桁（音符の横棒）による誤判定を抑制しました。")
+st.set_page_config(page_title="ドレミ付与ツール V3.1", layout="centered")
+st.title("🎼 楽譜ドレミ付与ツール V3.1")
+st.write("エラーを修正しました。音階を判定して表示します。")
 
 st.sidebar.header("⚙️ 設定")
-flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4) # 小犬のワルツは4つ
+flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4) 
 sens = st.sidebar.slider("検出感度", 0.4, 0.95, 0.65, 0.01)
 
 up = st.file_uploader("PDF形式の楽譜をアップロードしてください", type="pdf")
 
 if up:
-    # PDFを画像に変換 (popplerが必要)
+    # PDFを画像に変換
     imgs = convert_from_bytes(up.read())
     with st.spinner('解析中...'):
         processed_imgs = []
@@ -198,8 +177,7 @@ if up:
             processed_imgs.append(res_im)
             st.image(res_im, use_column_width=True)
 
-    # PDFダウンロードボタン
-    pdf_buf = io.BytesIO()
     if processed_imgs:
+        pdf_buf = io.BytesIO()
         processed_imgs[0].save(pdf_buf, format='PDF', save_all=True, append_images=processed_imgs[1:])
         st.download_button(label="完成版PDFをダウンロード", data=pdf_buf.getvalue(), file_name="doremi_score_v3.pdf", mime="application/pdf")
