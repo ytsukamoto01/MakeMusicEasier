@@ -6,10 +6,10 @@ import io
 from pdf2image import convert_from_bytes
 
 # ==========================================
-# 1. 楽譜解析エンジン（V7：白抜き穴埋め・重心統合版）
+# 1. 楽譜解析エンジン（V8：幾何学フィルタリング版）
 # ==========================================
 
-def detect_staff_groups_v7(pil_img):
+def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
     _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     projection = np.sum(thresh, axis=1)
@@ -44,13 +44,8 @@ def detect_staff_groups_v7(pil_img):
             i += 1
     return staves, avg_spacing if staves else 10
 
-def nms_v7_centroid(boxes, scores, staff_space):
-    """
-    重複除去V7: 中心点間の距離に基づいて、近すぎる検出を統合する
-    """
+def nms_v8_strict(boxes, scores, staff_space):
     if len(boxes) == 0: return []
-    
-    # スコアが高い順に並び替え
     idxs = np.argsort(scores)[::-1]
     pick = []
     
@@ -58,58 +53,64 @@ def nms_v7_centroid(boxes, scores, staff_space):
         i = idxs[0]
         pick.append(i)
         
-        # 現在の音符の中心点
-        curr_center_x = (boxes[i, 0] + boxes[i, 2]) / 2
-        curr_center_y = (boxes[i, 1] + boxes[i, 3]) / 2
+        c_x = (boxes[i, 0] + boxes[i, 2]) / 2
+        c_y = (boxes[i, 1] + boxes[i, 3]) / 2
         
-        remaining_idxs = idxs[1:]
-        if len(remaining_idxs) == 0: break
+        remaining = idxs[1:]
+        if len(remaining) == 0: break
         
-        # 他の音符の中心点
-        other_centers_x = (boxes[remaining_idxs, 0] + boxes[remaining_idxs, 2]) / 2
-        other_centers_y = (boxes[remaining_idxs, 1] + boxes[remaining_idxs, 3]) / 2
+        o_x = (boxes[remaining, 0] + boxes[remaining, 2]) / 2
+        o_y = (boxes[remaining, 1] + boxes[remaining, 3]) / 2
         
-        # 距離を計算
-        dist = np.sqrt((curr_center_x - other_centers_x)**2 + (curr_center_y - other_centers_y)**2)
+        dist = np.sqrt((c_x - o_x)**2 + (c_y - o_y)**2)
         
-        # 【重要】五線幅の60%より近いものは「同じ音符への重複反応」とみなして削除
-        # ただし、和音（縦の並び）を殺さないよう、x座標のズレが非常に小さい場合のみ縦距離を厳しく見る
-        x_dist = np.abs(curr_center_x - other_centers_x)
-        y_dist = np.abs(curr_center_y - other_centers_y)
+        # 非常に近いものは削除（重複）
+        # ただし和音を考慮し、縦方向の重なりには少し寛容にする
+        duplicate = (dist < staff_space * 0.7)
+        idxs = np.delete(remaining, np.where(duplicate)[0])
         
-        # 同じ音符判定：中心が近すぎる、または横位置がほぼ同じで縦も近すぎる
-        duplicate = (dist < staff_space * 0.6) | ((x_dist < staff_space * 0.3) & (y_dist < staff_space * 0.7))
-        
-        idxs = np.delete(remaining_idxs, np.where(duplicate)[0])
-        # deleteによってインデックスがズレるのを防ぐため、元のidxsリストを更新
-        idxs = idxs[~np.isin(idxs, remaining_idxs[duplicate])] 
-
     return boxes[pick].astype("int")
 
-def detect_note_heads_v7(gray_img, staff_space, user_threshold):
+def detect_note_heads_v8(gray_img, staff_space, user_threshold, staves):
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 【新兵器】クロージング処理：白抜き音符の中を塗りつぶす
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(staff_space*0.6), int(staff_space*0.6)))
-    filled_thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
+    # クロージングで白抜き音符を埋める
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(staff_space*0.6), int(staff_space*0.6)))
+    filled = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_k)
     
-    # ノイズ除去
-    k_size = max(2, int(staff_space * 0.3))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    clean_thresh = cv2.morphologyEx(filled_thresh, cv2.MORPH_OPEN, kernel)
+    # テンプレートマッチング
+    nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
+    template = np.zeros((nh, nw), dtype=np.uint8)
+    cv2.ellipse(template, (nw//2, nh//2), (nw//2-1, nh//2-1), -20, 0, 360, 255, -1)
     
-    nw, nh = int(staff_space * 1.2), int(staff_space * 0.9)
-    template = np.zeros((nh + 4, nw + 4), dtype=np.uint8)
-    cv2.ellipse(template, (nw//2+2, nh//2+2), (nw//2, nh//2), -20, 0, 360, 255, -1)
-
-    res = cv2.matchTemplate(clean_thresh, template, cv2.TM_CCOEFF_NORMED)
-    
+    res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= user_threshold)
-    scores = res[loc]
-    rects = [[int(pt[0]), int(pt[1]), int(pt[0]+nw), int(pt[1]+nh)] for pt in zip(*loc[::-1])]
     
-    if not rects: return []
-    return nms_v7_centroid(np.array(rects), scores, staff_space)
+    raw_rects = []
+    raw_scores = []
+    
+    # すべての五線の中心領域を計算（垂直方向のフィルタリング用）
+    staff_centers = [np.mean(s) for s in staves]
+    
+    for pt in zip(*loc[::-1]):
+        x, y = int(pt[0]), int(pt[1])
+        w, h = nw, nh
+        score = res[y, x]
+        
+        # 【V8新機能】幾何学フィルタリング
+        # 1. 五線から離れすぎていないか（加線4本分程度まで許可）
+        dist_to_nearest_staff = min([abs((y + h//2) - c) for c in staff_centers])
+        if dist_to_nearest_staff > staff_space * 6:
+            continue
+            
+        # 2. 形のチェック（極端に細長いものはト音記号の破片や小節線）
+        # テンプレートマッチングなので基本はテンプレートの形だが、
+        # 背景との兼ね合いで歪んだものを排除
+        raw_rects.append([x, y, x + w, y + h])
+        raw_scores.append(score)
+        
+    if not raw_rects: return []
+    return nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space)
 
 def get_pitch_name(note_y, staff, clef, flats_count):
     line1, line5 = staff[0], staff[4]
@@ -125,11 +126,14 @@ def get_pitch_name(note_y, staff, clef, flats_count):
     flat_order = ["シ", "ミ", "ラ", "レ", "ソ", "ド", "ファ"]
     return name, name in flat_order[:flats_count]
 
-def process_page_v7(pil_img, threshold, flats_count):
-    staves, space = detect_staff_groups_v7(pil_img)
+def process_page_v8(pil_img, threshold, flats_count):
+    staves, space = detect_staff_groups_v8(pil_img)
     if not staves: return pil_img
     img_gray = np.array(pil_img.convert('L'))
-    notes = detect_note_heads_v7(img_gray, space, threshold)
+    
+    # 五線情報を渡してフィルタリング
+    notes = detect_note_heads_v8(img_gray, space, threshold, staves)
+    
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
     try: font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(15, int(space)))
@@ -142,13 +146,14 @@ def process_page_v7(pil_img, threshold, flats_count):
         p_name, is_flat = get_pitch_name(yc, staves[s_idx], "treble" if s_idx % 2 == 0 else "bass", flats_count)
         if p_name:
             draw.rectangle(b, outline=(0, 255, 0), width=2)
-            draw.text((b[0], b[1] - int(space * 1.6)), p_name, font=font, fill=((0,0,255) if is_flat else (255,0,0)))
+            color = (0, 0, 255) if is_flat else (255, 0, 0)
+            draw.text((b[0], b[1] - int(space * 1.6)), p_name, font=font, fill=color)
     return result
 
 # Streamlit UI
-st.set_page_config(page_title="ドレミ付与 V7", layout="centered")
-st.title("🎼 ドレミ付与ツール V7")
-st.write("白抜き音符を自動で穴埋め検出し、重複を重心距離でカットする最新版です。")
+st.set_page_config(page_title="ドレミ付与 V8", layout="centered")
+st.title("🎼 ドレミ付与ツール V8 (ノイズ除去強化)")
+st.write("ト音記号やペダル記号などの「音符ではないもの」を賢く除外します。")
 
 st.sidebar.header("⚙️ 設定")
 flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4) 
@@ -158,5 +163,5 @@ up = st.file_uploader("PDFをアップロード", type="pdf")
 if up:
     imgs = convert_from_bytes(up.read())
     with st.spinner('解析中...'):
-        for im in [process_page_v7(i, sens, flats) for i in imgs]:
+        for im in [process_page_v8(i, sens, flats) for i in imgs]:
             st.image(im, use_column_width=True)
