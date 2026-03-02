@@ -110,12 +110,10 @@ def non_max_suppression(boxes, overlapThresh):
     return boxes[pick].astype("int")
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
-    """画像処理の魔法（オープニング）を追加して、ノイズを消し去ってから検出する"""
+    """密度フィルターを追加し、スカスカなノイズ（♭や休符）を排除する"""
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 【魔法のフィルター】形態学的変換（Opening）
-    # 五線や棒、スラー、テキストの細い線などを消し去り、オタマジャクシの丸みだけを残す
-    k_size = max(2, int(staff_space * 0.55)) # 線の太さより大きく、音符より小さいサイズ
+    k_size = max(2, int(staff_space * 0.55)) 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
@@ -129,7 +127,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     axes = (template_w // 2, template_h // 2)
     cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
-    # 【重要】元の画像ではなく、ノイズを消し去った clean_thresh に対してマッチング！
     result = cv2.matchTemplate(clean_thresh, template, cv2.TM_CCOEFF_NORMED)
     locations = np.where(result >= user_threshold)
 
@@ -144,7 +141,22 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     boxes = np.array(rectangles)
     picked_boxes = non_max_suppression(boxes, overlapThresh=0.3)
 
-    return picked_boxes
+    # 【最強の追加武器：密度フィルター】
+    final_boxes = []
+    for (x1, y1, x2, y2) in picked_boxes:
+        # 枠内の画像を切り出す（元の二値化画像を使う）
+        roi = thresh[y1:y2, x1:x2]
+        if roi.size == 0: continue
+        
+        # 枠内の「白ピクセル（元の黒インク）」の割合を計算
+        fill_ratio = np.count_nonzero(roi) / roi.size
+        
+        # 枠の半分以上が塗りつぶされている（本物の音符）ものだけを残す！
+        # ※もし本物の音符まで消える場合は 0.50 を 0.40 などに下げてください
+        if fill_ratio > 0.50:
+            final_boxes.append([x1, y1, x2, y2])
+
+    return final_boxes
 
 def calculate_pitch(note_center_y, staves, clefs):
     """音符のY座標と音部記号（ト音/ヘ音）から音階を正しく計算する"""
