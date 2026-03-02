@@ -212,7 +212,7 @@ def analyze_score_v2(pil_img, user_threshold):
     
     try:
         note_h = int(staff_space * 0.9)
-        font = ImageFont.truetype("font.ttf", max(14, note_h))
+        font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(14, note_h))
     except IOError:
         font = ImageFont.load_default()
 
