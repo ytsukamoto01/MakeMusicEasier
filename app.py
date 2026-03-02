@@ -106,7 +106,7 @@ if uploaded_file is not None:
         
         for i, img in enumerate(images):
             # さっき作ったOpenCVの関数で五線を検出！
-            result_img = detect_staff_lines(img)
+            result_img = detect_note_heads(img) #detect_staff_lines(img)
             
             processed_images.append(result_img)
             
