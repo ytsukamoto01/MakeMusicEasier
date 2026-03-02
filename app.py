@@ -110,25 +110,27 @@ def non_max_suppression(boxes, overlapThresh):
     return boxes[pick].astype("int")
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
-    """五線間隔から音符サイズを自動推定し、NMSで重複を除去して符頭の真の中心を検出する"""
+    """画像処理の魔法（オープニング）を追加して、ノイズを消し去ってから検出する"""
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 五線間隔から音符（符頭）のサイズを推定
-    # 符頭は通常、五線間隔とほぼ同じか少し小さい。
+    # 【魔法のフィルター】形態学的変換（Opening）
+    # 五線や棒、スラー、テキストの細い線などを消し去り、オタマジャクシの丸みだけを残す
+    k_size = max(2, int(staff_space * 0.55)) # 線の太さより大きく、音符より小さいサイズ
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
     note_w = int(staff_space * 1.2)
     note_h = int(staff_space * 0.9)
     
-    # テンプレートを作成（黒塗りの傾いた楕円）
     template_w = note_w
     template_h = note_h
     template = np.zeros((template_h + 10, template_w + 10), dtype=np.uint8)
     center = ((template_w + 10) // 2, (template_h + 10) // 2)
     axes = (template_w // 2, template_h // 2)
-    # 少し傾ける
     cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
-    # テンプレートマッチング
-    result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
+    # 【重要】元の画像ではなく、ノイズを消し去った clean_thresh に対してマッチング！
+    result = cv2.matchTemplate(clean_thresh, template, cv2.TM_CCOEFF_NORMED)
     locations = np.where(result >= user_threshold)
 
     rectangles = []
@@ -139,7 +141,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     if not rectangles:
         return []
 
-    # 重複を除去する Non-Maximum Suppression (NMS)
     boxes = np.array(rectangles)
     picked_boxes = non_max_suppression(boxes, overlapThresh=0.3)
 
@@ -180,7 +181,8 @@ def calculate_pitch(note_center_y, staves, clefs):
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
-    """高精度版解析関数（バグ修正・完成版）"""
+    """高精度版解析関数（ノイズ完全シャットアウト版）"""
+    
     deskewed_pil = deskew(pil_img)
     staff_y_coords, gray_img = detect_staff_lines_precise(deskewed_pil)
     
@@ -190,12 +192,10 @@ def analyze_score_v2(pil_img, user_threshold):
     staff_space = np.median(np.diff(staff_y_coords))
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
-    # 【修正1】五線の重複登録を防ぐ堅牢なロジック！
     staves = []
     i = 0
     while i <= len(staff_y_coords) - 5:
         height = staff_y_coords[i+4] - staff_y_coords[i]
-        # 5本線の幅が正常（間隔の3〜5倍）なら段として登録し、次の5本へスキップ
         if staff_space * 3 < height < staff_space * 5: 
             staves.append(staff_y_coords[i:i+5])
             i += 5 
@@ -218,11 +218,17 @@ def analyze_score_v2(pil_img, user_threshold):
         font = ImageFont.load_default()
 
     staff_notes = {i: [] for i in range(len(staves))}
+    margin = staff_space * 7 # 五線から約7加線分までを「音符が存在できる限界」とする
+    
     for box in picked_boxes:
         note_center_y = int((box[1] + box[3]) / 2)
         distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
         closest_idx = int(np.argmin(distances))
-        staff_notes[closest_idx].append(box)
+        
+        # 【新ルール】五線から遠すぎるノイズ（ペダル記号・タイトルなど）は強制的に捨てる！
+        closest_staff = staves[closest_idx]
+        if (closest_staff[0] - margin) <= note_center_y <= (closest_staff[4] + margin):
+            staff_notes[closest_idx].append(box)
 
     for staff_idx, notes in staff_notes.items():
         if not notes: continue
@@ -235,8 +241,8 @@ def analyze_score_v2(pil_img, user_threshold):
             if not current_chord:
                 current_chord.append(box)
             else:
-                # 【修正3】フラット記号などを和音に巻き込まないよう、重なり判定を厳格化
-                if abs(box[0] - current_chord[-1][0]) < (staff_space * 0.8):
+                # 【新ルール】右手の速いメロディが和音と勘違いされないよう、横幅のズレ判定をさらに厳格化（0.5倍）
+                if abs(box[0] - current_chord[-1][0]) < (staff_space * 0.5):
                     current_chord.append(box)
                 else:
                     chords.append(current_chord)
@@ -252,6 +258,7 @@ def analyze_score_v2(pil_img, user_threshold):
                 doremi = calculate_pitch(note_center_y, staves, clefs)
                 if doremi:
                     pitches.append(doremi)
+                    # 枠を描画（確認用：緑色）
                     draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
             
             if pitches:
