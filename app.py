@@ -87,13 +87,33 @@ def analyze_score(pil_img, template_w, template_h, threshold):
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
     # ==========================================
-    # 1. 五線の検出（Y座標のリストを取得）
+    # 1. 五線の検出とグループ化（クラスタリング）
     # ==========================================
     horizontal_sum = np.sum(thresh, axis=1)
     width = thresh.shape[1]
     line_threshold = width * 255 * 0.5
-    # 五線が存在するY座標をすべて取得
-    staff_y_coords = np.where(horizontal_sum > line_threshold)[0]
+    raw_y_coords = np.where(horizontal_sum > line_threshold)[0]
+
+    # 太い線を「1本のY座標」にまとめる
+    lines = []
+    current_cluster = []
+    for y in raw_y_coords:
+        if not current_cluster:
+            current_cluster.append(y)
+        elif y - current_cluster[-1] <= 5: # 5px以内のズレは同じ線とみなす
+            current_cluster.append(y)
+        else:
+            lines.append(int(np.mean(current_cluster)))
+            current_cluster = [y]
+    if current_cluster:
+        lines.append(int(np.mean(current_cluster)))
+
+    # 5本ずつグループ化して「1つの段」にする
+    staves = []
+    for i in range(0, len(lines) - 4):
+        # 5本の線の間隔が広すぎないかチェックして段として登録
+        if lines[i+4] - lines[i] < template_h * 5: 
+            staves.append(lines[i:i+5])
 
     # ==========================================
     # 2. 音符の検出とグループ化
@@ -115,45 +135,51 @@ def analyze_score(pil_img, template_w, template_h, threshold):
     grouped_rects, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
 
     # ==========================================
-    # 3. フィルタリングと「ドレミ」の書き込み
+    # 3. Y座標から「ドレミ」を計算して書き込む！
     # ==========================================
-    # 綺麗な文字を書き込むために、OpenCVの画像をPillowの画像に戻す
     result_pil = Image.fromarray(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
     draw = ImageDraw.Draw(result_pil)
-    
-    # 日本語フォントの読み込み
     try:
-        font = ImageFont.truetype("font.ttf", max(16, template_h)) # 音符のサイズに合わせてフォントサイズを調整
+        font = ImageFont.truetype("font.ttf", max(16, template_h))
     except IOError:
         font = ImageFont.load_default()
 
-    # 五線が1つも見つからなかった場合はそのまま返す
-    if len(staff_y_coords) == 0:
+    if not staves:
         return result_pil
 
-    # 見つけた音符候補を1つずつチェック
+    # ト音記号のドレミ配列（基準の第5線=0 から、下に何ステップ移動したか）
+    pitch_names = {
+        -2: "ラ", -1: "ソ", 0: "ファ", 1: "ミ", 2: "レ", 3: "ド",
+        4: "シ", 5: "ラ", 6: "ソ", 7: "ファ", 8: "ミ", 9: "レ",
+        10: "ド", 11: "シ", 12: "ラ", 13: "ソ"
+    }
+
     for (x, y, w, h) in grouped_rects:
-        # 音符の中心のY座標
         note_center_y = y + h // 2
         
-        # 一番近い五線のY座標を探し、その「距離」を計算する
-        closest_line_y = min(staff_y_coords, key=lambda line_y: abs(line_y - note_center_y))
-        distance = abs(closest_line_y - note_center_y)
+        # 一番近い「段（5本線のグループ）」を探す
+        closest_staff = min(staves, key=lambda staff: abs(np.mean(staff) - note_center_y))
         
-        # 【重要】五線から大きく離れているもの（タイトルや歌詞）は無視！
-        # ※ 加線（五線の外側にある短い線）の音符も拾えるように、少し余裕を持たせています
-        if distance > template_h * 3: 
+        top_line_y = closest_staff[0]
+        bottom_line_y = closest_staff[4]
+        
+        # 五線の間隔から「1ステップ（音符1つ分の縦移動）」の高さを計算
+        # 5本の線の間には4つの空間があるため、線〜線までの距離を8分割すると1ステップになります
+        step_height = (bottom_line_y - top_line_y) / 8.0 
+        
+        # 一番上の線からの距離をステップ数に変換（四捨五入で最も近い位置に合わせる）
+        steps_down = round((note_center_y - top_line_y) / step_height)
+        
+        # 加線が多すぎる（範囲外）ものは文字やゴミとして除外
+        if steps_down < -3 or steps_down > 14:
             continue
             
-        # --- ここから下は「本物の音符」だけが通れる ---
+        # ドレミを取得！
+        doremi = pitch_names.get(steps_down, "?")
         
-        # 枠を描画（確認用：緑色）
+        # 枠と文字を描画
         draw.rectangle([x, y, x + w, y + h], outline=(0, 255, 0), width=2)
-        
-        # 【仮のドレミ判定】
-        # ※ 本当は五線の「どの高さ」にいるかでドレミを計算しますが、
-        # まずはフィルタリング成功の証として、すべての音符に「ド」と書き込みます！
-        draw.text((x, y - template_h - 5), "ド", font=font, fill=(255, 0, 0))
+        draw.text((x, y - template_h - 10), doremi, font=font, fill=(255, 0, 0))
 
     return result_pil
 
