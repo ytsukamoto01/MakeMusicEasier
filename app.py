@@ -179,7 +179,7 @@ def calculate_pitch(note_center_y, staves, clefs):
     return pitch_names.get(steps_down, None)
 
 # ==========================================
-# 解析マスター関数 V2 (高精度版)
+# 解析マスター関数 V2 (高精度版・デバッグモード)
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
@@ -200,13 +200,11 @@ def analyze_score_v2(pil_img, user_threshold):
         else:
             merged_y_coords.append(y)
 
-    # 【変更】複雑なスコアリングを除外。等間隔の5本線をシンプルに抽出。
     possible_staves = []
     for i in range(len(merged_y_coords) - 4):
         staff_lines = merged_y_coords[i:i+5]
         gaps = np.diff(staff_lines)
         
-        # 連続する5本の線の間隔が、すべて許容範囲内(0.7〜1.3倍)なら五線の候補とする
         if np.all((gaps > staff_space * 0.7) & (gaps < staff_space * 1.3)):
             possible_staves.append(staff_lines)
             
@@ -215,18 +213,30 @@ def analyze_score_v2(pil_img, user_threshold):
         if not staves:
             staves.append(staff_lines)
         else:
-            # 既に確定した段とY座標が被っていなければ追加（重複登録を防ぐだけ）
             if staff_lines[0] > staves[-1][4] + staff_space * 2:
                 staves.append(staff_lines)
 
-    if not staves:
-        return deskewed_pil
-
-    clefs = ["treble" if i % 2 == 0 else "bass" for i in range(len(staves))]
-
+    # 描画準備
     result_pil = deskewed_pil.copy()
     result_pil = result_pil.convert("RGB")
     draw = ImageDraw.Draw(result_pil)
+    img_width = result_pil.size[0]
+
+    # --- 🛠️ デバッグ用可視化 🛠️ ---
+    # 1. 検出された全ての水平線（薄い赤）
+    for y in merged_y_coords:
+        draw.line([(0, y), (img_width, y)], fill=(255, 150, 150), width=1)
+        
+    # 2. 最終的に五線として確定した線（青）
+    for staff in staves:
+        for y in staff:
+            draw.line([(0, y), (img_width, y)], fill=(50, 50, 255), width=2)
+    # ------------------------------
+
+    if not staves:
+        return result_pil
+
+    clefs = ["treble" if i % 2 == 0 else "bass" for i in range(len(staves))]
     
     try:
         note_h = int(staff_space * 0.9)
@@ -237,7 +247,6 @@ def analyze_score_v2(pil_img, user_threshold):
     staff_notes = {i: [] for i in range(len(staves))}
     margin = staff_space * 8 
     
-    img_width = deskewed_pil.size[0]
     ignore_x_zone = int(img_width * 0.08)
     
     for box in picked_boxes:
@@ -305,14 +314,12 @@ def analyze_score_v2(pil_img, user_threshold):
 # Streamlit アプリケーション UI
 # ==========================================
 
-st.set_page_config(page_title="ドレミ自動付与ツール V2", layout="centered")
-st.title("🎼 楽譜ドレミ自動付与ツール V2")
-st.write("PDFの楽譜をアップロードすると、自動で音階を解析します（高精度版）。")
+st.set_page_config(page_title="ドレミ自動付与ツール V2 (デバッグ版)", layout="centered")
+st.title("🎼 楽譜ドレミ自動付与ツール V2 (デバッグ版)")
+st.write("認識された線を赤色・青色で可視化します。")
 
 st.sidebar.header("⚙️ 検出パラメータの調整")
-st.sidebar.write("プレビューを見ながら、音符が綺麗に囲まれるように感度を調整してください。")
 ui_threshold = st.sidebar.slider("検出感度 (低いほど多く検出)", 0.40, 0.95, 0.65, 0.01)
-st.sidebar.info("音符のサイズは楽譜の五線間隔から自動で推定されます。")
 
 uploaded_file = st.file_uploader("PDF形式の楽譜を選択してください", type=["pdf"])
 
@@ -328,7 +335,7 @@ if uploaded_file is not None:
             processed_images.append(result_img)
             st.image(result_img, caption=f"{i+1}ページ目", use_column_width=True)
 
-    st.success("処理が完了しました！")
+    st.success("処理が完了しました！線の認識状況を確認してください。")
 
     pdf_byte_arr = io.BytesIO()
     processed_images[0].save(
@@ -337,8 +344,8 @@ if uploaded_file is not None:
     )
     
     st.download_button(
-        label="ドレミ付き楽譜をダウンロード",
+        label="デバッグ版画像をダウンロード",
         data=pdf_byte_arr.getvalue(),
-        file_name="doremi_score.pdf",
+        file_name="debug_score.pdf",
         mime="application/pdf"
     )
