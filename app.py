@@ -110,52 +110,52 @@ def non_max_suppression(boxes, overlapThresh):
     return boxes[pick].astype("int")
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
-    """音符の丸みだけを検出し、密度フィルターでノイズを除去する"""
-    _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, thresh = cv2.threshold(gray_img, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 削りすぎないよう少し優しめに設定（細い線を消し去る）
-    k_size = max(2, int(staff_space * 0.45)) 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-    note_w = int(staff_space * 1.2)
+    note_w = int(staff_space * 1.1)
     note_h = int(staff_space * 0.9)
-    
-    # パッド（余白）を設定してテンプレートを作成
-    pad = 5
-    template_w = note_w
-    template_h = note_h
-    template = np.zeros((template_h + pad*2, template_w + pad*2), dtype=np.uint8)
-    center = (template_w // 2 + pad, template_h // 2 + pad)
-    axes = (template_w // 2, template_h // 2)
-    cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
-    result = cv2.matchTemplate(clean_thresh, template, cv2.TM_CCOEFF_NORMED)
-    locations = np.where(result >= user_threshold)
+    pad = 4
+    templates = []
+
+    # 角度違いテンプレを2種用意（実戦でかなり効く）
+    for angle in [-20, 0]:
+        template = np.zeros((note_h + pad*2, note_w + pad*2), dtype=np.uint8)
+        center = (note_w // 2 + pad, note_h // 2 + pad)
+        axes = (note_w // 2, note_h // 2)
+        cv2.ellipse(template, center, axes, angle, 0, 360, 255, -1)
+        templates.append(template)
 
     rectangles = []
-    for pt in zip(*locations[::-1]):
-        # 余白(pad)の分だけ座標を補正し、純粋な音符だけを囲む
-        x1 = int(pt[0] + pad)
-        y1 = int(pt[1] + pad)
-        rect_data = [x1, y1, x1 + template_w, y1 + template_h]
-        rectangles.append(rect_data)
+
+    for template in templates:
+        result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
+        locations = np.where(result >= user_threshold)
+
+        for pt in zip(*locations[::-1]):
+            x1 = int(pt[0] + pad)
+            y1 = int(pt[1] + pad)
+            rectangles.append([x1, y1,
+                               x1 + note_w,
+                               y1 + note_h])
 
     if not rectangles:
         return []
 
     boxes = np.array(rectangles)
-    picked_boxes = non_max_suppression(boxes, overlapThresh=0.3)
+    picked = non_max_suppression(boxes, overlapThresh=0.35)
 
     final_boxes = []
-    for (x1, y1, x2, y2) in picked_boxes:
+    for (x1, y1, x2, y2) in picked:
         roi = thresh[y1:y2, x1:x2]
-        if roi.size == 0: continue
-        
+        if roi.size == 0:
+            continue
+
         fill_ratio = np.count_nonzero(roi) / roi.size
-        
-        # スカスカなノイズ(40%未満)と、真っ黒な連桁(90%以上)の両方をカット
-        if 0.40 < fill_ratio < 0.90:
+
+        # 連桁除去だけ軽く残す
+        if 0.35 < fill_ratio < 0.92:
             final_boxes.append([x1, y1, x2, y2])
 
     return final_boxes
@@ -246,10 +246,6 @@ def analyze_score_v2(pil_img, user_threshold):
     
     # ショパンの超高音に対応するため、マージンを拡大（8加線分まで許可）
     margin = staff_space * 8 
-    
-    img_width = deskewed_pil.size[0]
-    # 画像の横幅の「左から8%」は調号・音部記号エリアとして無視
-    ignore_x_zone = int(img_width * 0.08)
     
     for box in picked_boxes:
         if box[0] < ignore_x_zone:
