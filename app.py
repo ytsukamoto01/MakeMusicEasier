@@ -26,22 +26,23 @@ if uploaded_file is not None:
     with st.spinner('ドレミを書き込み中...'):
         processed_images = []
         
-        # フォントの設定 (Streamlit Cloudのデフォルトフォントを使用)
-        # ※日本語フォントがない場合、文字化け（豆腐化）する可能性があります。後で修正します。
-        font = ImageFont.load_default() 
+        # 変更点：アップロードした日本語フォントを読み込む
+        # 第2引数の「32」は文字のサイズです。お好みで変更してください。
+        try:
+            font = ImageFont.truetype("font.ttf", 32) 
+        except IOError:
+            st.error("フォントファイル(font.ttf)が見つかりません。デフォルトフォントを使用します。")
+            font = ImageFont.load_default()
 
         for i, img in enumerate(images):
-            # 画像に書き込むための準備
             draw = ImageDraw.Draw(img)
             
-            # 【仮の処理】座標 (x=100, y=100) と (x=200, y=150) に文字を書き込む
-            # 実際にはここに「AIが見つけた音符のX,Y座標」が入ります
-            draw.text((100, 100), "Do", font=font, fill=(255, 0, 0)) # 赤色で「Do」
-            draw.text((200, 150), "Re", font=font, fill=(255, 0, 0)) # 赤色で「Re」
+            # 【変更点】日本語で「ド」「レ」を書き込む
+            draw.text((100, 100), "ド", font=font, fill=(255, 0, 0)) 
+            draw.text((200, 150), "レ", font=font, fill=(255, 0, 0)) 
             
             processed_images.append(img)
             
-            # 画面にもプレビュー表示
             st.image(img, caption=f"{i+1}ページ目 (処理後)", use_column_width=True)
 
     st.success("処理が完了しました！")
