@@ -29,7 +29,7 @@ if uploaded_file is not None:
         # 変更点：アップロードした日本語フォントを読み込む
         # 第2引数の「32」は文字のサイズです。お好みで変更してください。
         try:
-            font = ImageFont.truetype("font.ttf", 32) 
+            font = ImageFont.truetype("NotoSansJP-Regular.ttf", 32) 
         except IOError:
             st.error("フォントファイル(font.ttf)が見つかりません。デフォルトフォントを使用します。")
             font = ImageFont.load_default()
