@@ -77,6 +77,86 @@ def detect_note_heads(pil_img, template_w, template_h, threshold):
 
     return Image.fromarray(result_img)
 
+def analyze_score(pil_img, template_w, template_h, threshold):
+    img_array = np.array(pil_img)
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # ==========================================
+    # 1. 五線の検出（Y座標のリストを取得）
+    # ==========================================
+    horizontal_sum = np.sum(thresh, axis=1)
+    width = thresh.shape[1]
+    line_threshold = width * 255 * 0.5
+    # 五線が存在するY座標をすべて取得
+    staff_y_coords = np.where(horizontal_sum > line_threshold)[0]
+
+    # ==========================================
+    # 2. 音符の検出とグループ化
+    # ==========================================
+    template = np.zeros((template_h + 10, template_w + 10), dtype=np.uint8)
+    center = ((template_w + 10) // 2, (template_h + 10) // 2)
+    axes = (template_w // 2, template_h // 2)
+    cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
+
+    result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
+    locations = np.where(result >= threshold)
+
+    rectangles = []
+    for pt in zip(*locations[::-1]):
+        rect_data = [int(pt[0]), int(pt[1]), int(template_w), int(template_h)]
+        rectangles.append(rect_data)
+        rectangles.append(rect_data)
+
+    grouped_rects, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
+
+    # ==========================================
+    # 3. フィルタリングと「ドレミ」の書き込み
+    # ==========================================
+    # 綺麗な文字を書き込むために、OpenCVの画像をPillowの画像に戻す
+    result_pil = Image.fromarray(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
+    draw = ImageDraw.Draw(result_pil)
+    
+    # 日本語フォントの読み込み
+    try:
+        font = ImageFont.truetype("font.ttf", max(16, template_h)) # 音符のサイズに合わせてフォントサイズを調整
+    except IOError:
+        font = ImageFont.load_default()
+
+    # 五線が1つも見つからなかった場合はそのまま返す
+    if len(staff_y_coords) == 0:
+        return result_pil
+
+    # 見つけた音符候補を1つずつチェック
+    for (x, y, w, h) in grouped_rects:
+        # 音符の中心のY座標
+        note_center_y = y + h // 2
+        
+        # 一番近い五線のY座標を探し、その「距離」を計算する
+        closest_line_y = min(staff_y_coords, key=lambda line_y: abs(line_y - note_center_y))
+        distance = abs(closest_line_y - note_center_y)
+        
+        # 【重要】五線から大きく離れているもの（タイトルや歌詞）は無視！
+        # ※ 加線（五線の外側にある短い線）の音符も拾えるように、少し余裕を持たせています
+        if distance > template_h * 3: 
+            continue
+            
+        # --- ここから下は「本物の音符」だけが通れる ---
+        
+        # 枠を描画（確認用：緑色）
+        draw.rectangle([x, y, x + w, y + h], outline=(0, 255, 0), width=2)
+        
+        # 【仮のドレミ判定】
+        # ※ 本当は五線の「どの高さ」にいるかでドレミを計算しますが、
+        # まずはフィルタリング成功の証として、すべての音符に「ド」と書き込みます！
+        draw.text((x, y - template_h - 5), "ド", font=font, fill=(255, 0, 0))
+
+    return result_pil
+
 # ページの設定
 st.set_page_config(page_title="ドレミ自動付与ツール", layout="centered")
 
@@ -106,12 +186,12 @@ if uploaded_file is not None:
         st.image(image, caption=f"{i+1}ページ目", use_column_width=True)
 
     # 3. 画像への書き込み処理 のループ内を以下のように変更
-    with st.spinner('音符を検出中...'):
+    with st.spinner('音符を解析中...'):
         processed_images = []
         
         for i, img in enumerate(images):
-            # スライダーの値 (ui_w, ui_h, ui_threshold) を関数に渡す！
-            result_img = detect_note_heads(img, ui_w, ui_h, ui_threshold)
+            # 新しい合体関数を呼び出す！
+            result_img = analyze_score(img, ui_w, ui_h, ui_threshold)
             
             processed_images.append(result_img)
             st.image(result_img, caption=f"{i+1}ページ目", use_column_width=True)
