@@ -145,31 +145,37 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 
     return picked_boxes
 
-def calculate_pitch(note_center_y, staves):
-    """音符のY座標から音階を計算する"""
-    # ト音記号の音階マッピング（第5線基準）
-    pitch_names = {
-        -2: "ラ", -1: "ソ", 0: "ファ", 1: "ミ", 2: "レ", 3: "ド",
-        4: "シ", 5: "ラ", 6: "ソ", 7: "ファ", 8: "ミ", 9: "レ",
-        10: "ド", 11: "シ", 12: "ラ", 13: "ソ"
-    }
+def calculate_pitch(note_center_y, staves, clefs):
+    """音符のY座標と音部記号（ト音/ヘ音）から音階を計算する"""
     
-    # 一番近い「段（5本線のグループ）」を探す
-    closest_staff = min(staves, key=lambda staff: abs(np.mean(staff) - note_center_y))
+    # 一番近い「段（5本線のグループ）」とその記号を探す
+    distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
+    closest_idx = int(np.argmin(distances))
+    closest_staff = staves[closest_idx]
+    clef = clefs[closest_idx]
     
     top_line_y = closest_staff[0]
     bottom_line_y = closest_staff[4]
-    
-    # 五線の間隔から「1ステップ（音符1つ分の縦移動）」の高さを計算
-    # 5本の線の間には4つの空間があるため、線〜線までの距離を8分割すると1ステップになります
     step_height = (bottom_line_y - top_line_y) / 8.0 
-    
-    # 一番上の線からの距離をステップ数に変換（四捨五入で最も近い位置に合わせる）
     steps_down = round((note_center_y - top_line_y) / step_height)
     
-    # 加線が多すぎる（範囲外）ものは文字やゴミとして除外
-    if steps_down < -3 or steps_down > 14:
+    if steps_down < -4 or steps_down > 16:
         return None
+        
+    if clef == "treble":
+        # ト音記号の音階マッピング（第5線=ファ 基準）
+        pitch_names = {
+            -4: "シ", -3: "ド", -2: "レ", -1: "ミ", 0: "ファ", 1: "ソ", 2: "ラ", 3: "シ", 
+            4: "ド", 5: "レ", 6: "ミ", 7: "ファ", 8: "ソ", 9: "ラ",
+            10: "シ", 11: "ド", 12: "レ", 13: "ミ", 14: "ファ"
+        }
+    else:
+        # ヘ音記号の音階マッピング（第5線=ラ 基準）
+        pitch_names = {
+            -4: "レ", -3: "ミ", -2: "ファ", -1: "ソ", 0: "ラ", 1: "シ", 2: "ド", 3: "レ",
+            4: "ミ", 5: "ファ", 6: "ソ", 7: "ラ", 8: "シ", 9: "ド",
+            10: "レ", 11: "ミ", 12: "ファ", 13: "ソ", 14: "ラ"
+        }
         
     return pitch_names.get(steps_down, "?")
 
@@ -178,61 +184,91 @@ def calculate_pitch(note_center_y, staves):
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
-    """高精度版解析関数"""
+    """高精度版解析関数（和音＆ヘ音記号対応）"""
     
-    # 0. 前処理：傾き補正
     deskewed_pil = deskew(pil_img)
-    
-    # 1. 五線検出の強化
     staff_y_coords, gray_img = detect_staff_lines_precise(deskewed_pil)
     
     if not staff_y_coords or len(staff_y_coords) < 5:
         return deskewed_pil
 
-    # 五線間隔を計算
     staff_space = np.median(np.diff(staff_y_coords))
-    
-    # 2. 音符検出の強化（自動サイズ推定、NMS）
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
-    # 3. 五線を段（5本線）にグループ化
     staves = []
     for i in range(0, len(staff_y_coords) - 4):
-        # 5本の線の間隔が広すぎないかチェックして段として登録
         if staff_y_coords[i+4] - staff_y_coords[i] < staff_space * 5: 
             staves.append(staff_y_coords[i:i+5])
             
     if not staves:
         return deskewed_pil
 
-    # 4. 音階計算と書き込み
-    # 綺麗な文字を書き込むために、Pillowの画像に戻す
+    # 【新機能】ピアノ用：奇数段をト音記号、偶数段をヘ音記号と判定
+    clefs = ["treble" if i % 2 == 0 else "bass" for i in range(len(staves))]
+
     result_pil = deskewed_pil.copy()
     result_pil = result_pil.convert("RGB")
     draw = ImageDraw.Draw(result_pil)
     
-    # 日本語フォントの読み込み
     try:
-        # 音符のサイズ（符頭の縦幅）に基づいてフォントサイズを決定
         note_h = int(staff_space * 0.9)
-        font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(16, note_h))
+        font = ImageFont.truetype("font.ttf", max(14, note_h))
     except IOError:
         font = ImageFont.load_default()
 
-    for (x1, y1, x2, y2) in picked_boxes:
-        # 音符の中心のY座標（picked_boxesはNMS済み）
-        note_center_y = int((y1 + y2) / 2)
-        template_h = y2 - y1
+    # 【新機能】X座標で音符をグループ化（和音のスマート処理）
+    picked_boxes = sorted(picked_boxes, key=lambda b: b[0]) # X座標で左から右へ並び替え
+    chords = []
+    current_chord = []
+    
+    for box in picked_boxes:
+        if not current_chord:
+            current_chord.append(box)
+        else:
+            # 横幅が近くに密集している音符は「同じ和音」としてまとめる
+            if abs(box[0] - current_chord[0][0]) < (staff_space * 2.0):
+                current_chord.append(box)
+            else:
+                chords.append(current_chord)
+                current_chord = [box]
+    if current_chord:
+        chords.append(current_chord)
+
+    # 和音ごとに処理して書き込む
+    for chord in chords:
+        # Y座標で上から下へ並び替え（高い音から順に文字にするため）
+        chord.sort(key=lambda b: b[1])
         
-        # 音階計算
-        doremi = calculate_pitch(note_center_y, staves)
+        pitches = []
+        for (x1, y1, x2, y2) in chord:
+            note_center_y = int((y1 + y2) / 2)
+            doremi = calculate_pitch(note_center_y, staves, clefs) # 変更：clefsを渡す
+            if doremi:
+                pitches.append(doremi)
+                draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
         
-        if doremi:
-            # 枠を描画（確認用：緑色）
-            draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
+        if pitches:
+            # 重複した音名（微小な誤検出）を省く
+            unique_pitches = []
+            for p in pitches:
+                if not unique_pitches or unique_pitches[-1] != p:
+                    unique_pitches.append(p)
             
-            # ドレミを書き込む
-            draw.text((x1, y1 - template_h - 10), doremi, font=font, fill=(255, 0, 0))
+            # 和音を「ソミド」のように1つの横書き文字列にする
+            chord_text = "".join(unique_pitches)
+            
+            # 一番上の音符の少し上にまとめてテキストを描画
+            top_box = chord[0]
+            tx = top_box[0] - (len(chord_text) * 2) # 文字数に合わせて少し左にずらす
+            ty = top_box[1] - note_h - 15
+            
+            # 文字が見やすいように白フチをつけるテクニック
+            draw.text((tx-1, ty), chord_text, font=font, fill=(255, 255, 255))
+            draw.text((tx+1, ty), chord_text, font=font, fill=(255, 255, 255))
+            draw.text((tx, ty-1), chord_text, font=font, fill=(255, 255, 255))
+            draw.text((tx, ty+1), chord_text, font=font, fill=(255, 255, 255))
+            # 本体の赤文字
+            draw.text((tx, ty), chord_text, font=font, fill=(255, 0, 0))
 
     return result_pil
 
