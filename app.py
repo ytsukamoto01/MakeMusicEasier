@@ -146,7 +146,7 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     return picked_boxes
 
 def calculate_pitch(note_center_y, staves, clefs):
-    """音符のY座標と音部記号（ト音/ヘ音）から音階を計算する"""
+    """音符のY座標と音部記号（ト音/ヘ音）から音階を正しく計算する"""
     
     # 一番近い「段（5本線のグループ）」とその記号を探す
     distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
@@ -163,18 +163,18 @@ def calculate_pitch(note_center_y, staves, clefs):
         return None
         
     if clef == "treble":
-        # ト音記号の音階マッピング（第5線=ファ 基準）
+        # 【修正】ト音記号（下に移動するほど音が下がるように反転）
         pitch_names = {
-            -4: "シ", -3: "ド", -2: "レ", -1: "ミ", 0: "ファ", 1: "ソ", 2: "ラ", 3: "シ", 
-            4: "ド", 5: "レ", 6: "ミ", 7: "ファ", 8: "ソ", 9: "ラ",
-            10: "シ", 11: "ド", 12: "レ", 13: "ミ", 14: "ファ"
+            -4: "ド", -3: "シ", -2: "ラ", -1: "ソ", 0: "ファ", 1: "ミ", 2: "レ", 3: "ド", 
+            4: "シ", 5: "ラ", 6: "ソ", 7: "ファ", 8: "ミ", 9: "レ",
+            10: "ド", 11: "シ", 12: "ラ", 13: "ソ", 14: "ファ"
         }
     else:
-        # ヘ音記号の音階マッピング（第5線=ラ 基準）
+        # 【修正】ヘ音記号（下に移動するほど音が下がるように反転）
         pitch_names = {
-            -4: "レ", -3: "ミ", -2: "ファ", -1: "ソ", 0: "ラ", 1: "シ", 2: "ド", 3: "レ",
-            4: "ミ", 5: "ファ", 6: "ソ", 7: "ラ", 8: "シ", 9: "ド",
-            10: "レ", 11: "ミ", 12: "ファ", 13: "ソ", 14: "ラ"
+            -4: "ミ", -3: "レ", -2: "ド", -1: "シ", 0: "ラ", 1: "ソ", 2: "ファ", 3: "ミ",
+            4: "レ", 5: "ド", 6: "シ", 7: "ラ", 8: "ソ", 9: "ファ",
+            10: "ミ", 11: "レ", 12: "ド", 13: "シ", 14: "ラ"
         }
         
     return pitch_names.get(steps_down, "?")
@@ -184,7 +184,7 @@ def calculate_pitch(note_center_y, staves, clefs):
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
-    """高精度版解析関数（和音＆ヘ音記号対応）"""
+    """高精度版解析関数（和音＆ヘ音記号対応・修正版）"""
     
     deskewed_pil = deskew(pil_img)
     staff_y_coords, gray_img = detect_staff_lines_precise(deskewed_pil)
@@ -203,7 +203,6 @@ def analyze_score_v2(pil_img, user_threshold):
     if not staves:
         return deskewed_pil
 
-    # 【新機能】ピアノ用：奇数段をト音記号、偶数段をヘ音記号と判定
     clefs = ["treble" if i % 2 == 0 else "bass" for i in range(len(staves))]
 
     result_pil = deskewed_pil.copy()
@@ -216,59 +215,72 @@ def analyze_score_v2(pil_img, user_threshold):
     except IOError:
         font = ImageFont.load_default()
 
-    # 【新機能】X座標で音符をグループ化（和音のスマート処理）
-    picked_boxes = sorted(picked_boxes, key=lambda b: b[0]) # X座標で左から右へ並び替え
-    chords = []
-    current_chord = []
-    
+    # 【新修正】まずは音符を「どの段（右手・左手）」に属しているかで分ける！
+    staff_notes = {i: [] for i in range(len(staves))}
     for box in picked_boxes:
-        if not current_chord:
-            current_chord.append(box)
-        else:
-            # 横幅が近くに密集している音符は「同じ和音」としてまとめる
-            if abs(box[0] - current_chord[0][0]) < (staff_space * 2.0):
+        note_center_y = int((box[1] + box[3]) / 2)
+        distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
+        closest_idx = int(np.argmin(distances))
+        staff_notes[closest_idx].append(box)
+
+    # 各段ごとに独立して和音の処理を行う
+    for staff_idx, notes in staff_notes.items():
+        if not notes:
+            continue
+            
+        # X座標で左から右へ並び替え
+        notes = sorted(notes, key=lambda b: b[0])
+        chords = []
+        current_chord = []
+        
+        for box in notes:
+            if not current_chord:
                 current_chord.append(box)
             else:
-                chords.append(current_chord)
-                current_chord = [box]
-    if current_chord:
-        chords.append(current_chord)
+                # 【新修正】同じ段の中で、横幅がピッタリくっついているものだけを和音とする
+                # 閾値を staff_space * 1.2 に狭め、隣の細かいメロディを巻き込まないようにしました
+                if abs(box[0] - current_chord[0][0]) < (staff_space * 1.2):
+                    current_chord.append(box)
+                else:
+                    chords.append(current_chord)
+                    current_chord = [box]
+        if current_chord:
+            chords.append(current_chord)
 
-    # 和音ごとに処理して書き込む
-    for chord in chords:
-        # Y座標で上から下へ並び替え（高い音から順に文字にするため）
-        chord.sort(key=lambda b: b[1])
-        
-        pitches = []
-        for (x1, y1, x2, y2) in chord:
-            note_center_y = int((y1 + y2) / 2)
-            doremi = calculate_pitch(note_center_y, staves, clefs) # 変更：clefsを渡す
-            if doremi:
-                pitches.append(doremi)
-                draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
-        
-        if pitches:
-            # 重複した音名（微小な誤検出）を省く
-            unique_pitches = []
-            for p in pitches:
-                if not unique_pitches or unique_pitches[-1] != p:
-                    unique_pitches.append(p)
+        # 和音ごとに処理して書き込む
+        for chord in chords:
+            # Y座標で上から下へ並び替え（高い音から順に文字にするため）
+            chord.sort(key=lambda b: b[1])
             
-            # 和音を「ソミド」のように1つの横書き文字列にする
-            chord_text = "".join(unique_pitches)
+            pitches = []
+            for (x1, y1, x2, y2) in chord:
+                note_center_y = int((y1 + y2) / 2)
+                doremi = calculate_pitch(note_center_y, staves, clefs)
+                if doremi:
+                    pitches.append(doremi)
+                    draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
             
-            # 一番上の音符の少し上にまとめてテキストを描画
-            top_box = chord[0]
-            tx = top_box[0] - (len(chord_text) * 2) # 文字数に合わせて少し左にずらす
-            ty = top_box[1] - note_h - 15
-            
-            # 文字が見やすいように白フチをつけるテクニック
-            draw.text((tx-1, ty), chord_text, font=font, fill=(255, 255, 255))
-            draw.text((tx+1, ty), chord_text, font=font, fill=(255, 255, 255))
-            draw.text((tx, ty-1), chord_text, font=font, fill=(255, 255, 255))
-            draw.text((tx, ty+1), chord_text, font=font, fill=(255, 255, 255))
-            # 本体の赤文字
-            draw.text((tx, ty), chord_text, font=font, fill=(255, 0, 0))
+            if pitches:
+                # 重複した音名（微小な誤検出）を省く
+                unique_pitches = []
+                for p in pitches:
+                    if not unique_pitches or unique_pitches[-1] != p:
+                        unique_pitches.append(p)
+                
+                chord_text = "".join(unique_pitches)
+                
+                # 一番上の音符の少し上にまとめてテキストを描画
+                top_box = chord[0]
+                tx = top_box[0] - (len(chord_text) * 2) 
+                ty = top_box[1] - note_h - 15
+                
+                # 白フチをつける
+                draw.text((tx-1, ty), chord_text, font=font, fill=(255, 255, 255))
+                draw.text((tx+1, ty), chord_text, font=font, fill=(255, 255, 255))
+                draw.text((tx, ty-1), chord_text, font=font, fill=(255, 255, 255))
+                draw.text((tx, ty+1), chord_text, font=font, fill=(255, 255, 255))
+                # 本体の赤文字
+                draw.text((tx, ty), chord_text, font=font, fill=(255, 0, 0))
 
     return result_pil
 
