@@ -52,16 +52,28 @@ def detect_note_heads(pil_img, template_w, template_h, threshold):
     axes = (template_w // 2, template_h // 2)
     cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
+# -- 前半はそのまま --
     result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
-    
-    # 渡された感度（閾値）を使用
     locations = np.where(result >= threshold)
 
-    result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    h_temp, w_temp = template.shape
+    # 1. 見つけた座標を [x, y, 横幅, 縦幅] のリストに変換する
+    rectangles = []
+    for pt in zip(*locations[::-1]):
+        rect_data = [int(pt[0]), int(pt[1]), int(template_w), int(template_h)]
+        rectangles.append(rect_data)
+        # ※OpenCVの仕様で、単独の枠が消えないように同じものを2回入れるテクニックです
+        rectangles.append(rect_data) 
 
-    for pt in zip(*locations[::-1]): 
-        cv2.rectangle(result_img, pt, (pt[0] + w_temp, pt[1] + h_temp), (0, 255, 0), 2)
+    # 2. 重なった四角形を1つにまとめる魔法の関数！
+    # groupThreshold=1 (1つ以上重なっているものを統合), eps=0.5 (まとめる距離の寛容さ)
+    grouped_rects, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=0.5)
+
+    # 3. 画面確認用（元の画像に緑色の枠を描く）
+    result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+
+    # まとまった後のスッキリした四角形だけを描画
+    for (x, y, w, h) in grouped_rects:
+        cv2.rectangle(result_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     return Image.fromarray(result_img)
 
