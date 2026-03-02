@@ -52,7 +52,6 @@ def detect_staff_lines_precise(pil_img):
     valid_diffs = diffs[diffs > 2]
     staff_space = np.median(valid_diffs) if len(valid_diffs) > 0 else np.median(diffs)
     
-    # 歪み・かすれ対策：短めのカーネルで開き、後で横に膨張させて線を繋げる
     kernel_len = max(5, int(staff_space * 1.5))
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
     horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
@@ -65,7 +64,6 @@ def detect_staff_lines_precise(pil_img):
     width = thresh.shape[1]
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        # 画像幅の1/8以上あれば五線候補（スラーなども拾うが後で弾く）
         if w > width // 8: 
             staff_y_coords.append(int(y + h // 2))
 
@@ -118,7 +116,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     note_w = int(staff_space * 1.2)
     note_h = int(staff_space * 0.9)
     
-    # 【最重要修正】余白(pad)を最小化。密集した音符同士が干渉して検出漏れするのを防ぐ
     pad = 2
     template_w = note_w
     template_h = note_h
@@ -140,7 +137,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
         return []
 
     boxes = np.array(rectangles)
-    # 密集地帯に対応するためNMS閾値を少し緩和
     picked_boxes = non_max_suppression(boxes, overlapThresh=0.4)
 
     final_boxes = []
@@ -149,7 +145,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
         if roi.size == 0: continue
         
         fill_ratio = np.count_nonzero(roi) / roi.size
-        # 密集した音符の「真っ黒」判定を95%まで緩和
         if 0.35 < fill_ratio < 0.95:
             final_boxes.append([x1, y1, x2, y2])
 
@@ -205,37 +200,24 @@ def analyze_score_v2(pil_img, user_threshold):
         else:
             merged_y_coords.append(y)
 
-    # 【新革命】スラー等のノイズ線に騙されない！「最も等間隔な5本線」だけを厳選するスコアリング方式
+    # 【変更】複雑なスコアリングを除外。等間隔の5本線をシンプルに抽出。
     possible_staves = []
     for i in range(len(merged_y_coords) - 4):
         staff_lines = merged_y_coords[i:i+5]
         gaps = np.diff(staff_lines)
         
+        # 連続する5本の線の間隔が、すべて許容範囲内(0.7〜1.3倍)なら五線の候補とする
         if np.all((gaps > staff_space * 0.7) & (gaps < staff_space * 1.3)):
-            variance = np.var(gaps) # 間隔のバラつき具合（低いほど綺麗）
-            possible_staves.append((variance, staff_lines))
-    
-    possible_staves.sort(key=lambda x: x[1][0])
-    
+            possible_staves.append(staff_lines)
+            
     staves = []
-    current_overlap_group = []
-    
-    for item in possible_staves:
-        if not current_overlap_group:
-            current_overlap_group.append(item)
+    for staff_lines in possible_staves:
+        if not staves:
+            staves.append(staff_lines)
         else:
-            # 前の候補とY座標が被っている場合（スラー混入などによる重複候補）
-            if item[1][0] < current_overlap_group[-1][1][4]:
-                current_overlap_group.append(item)
-            else:
-                # 重複グループの中で、一番分散が小さい（＝最も等間隔な）本物の5本線を採用
-                best_staff = min(current_overlap_group, key=lambda x: x[0])[1]
-                staves.append(best_staff)
-                current_overlap_group = [item]
-                
-    if current_overlap_group:
-        best_staff = min(current_overlap_group, key=lambda x: x[0])[1]
-        staves.append(best_staff)
+            # 既に確定した段とY座標が被っていなければ追加（重複登録を防ぐだけ）
+            if staff_lines[0] > staves[-1][4] + staff_space * 2:
+                staves.append(staff_lines)
 
     if not staves:
         return deskewed_pil
