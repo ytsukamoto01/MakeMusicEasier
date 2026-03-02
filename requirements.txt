@@ -2,3 +2,5 @@ streamlit
 pdf2image
 music21
 Pillow
+opencv-python-headless
+numpy
