@@ -110,9 +110,10 @@ def non_max_suppression(boxes, overlapThresh):
     return boxes[pick].astype("int")
 
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
+    """音符の丸みだけを検出し、密度フィルターでノイズを除去する"""
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 削りすぎないよう少し優しめに設定
+    # 削りすぎないよう少し優しめに設定（細い線を消し去る）
     k_size = max(2, int(staff_space * 0.45)) 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
@@ -120,7 +121,7 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     note_w = int(staff_space * 1.2)
     note_h = int(staff_space * 0.9)
     
-    # 【大バグ修正！】パッド（余白）のズレを修正
+    # パッド（余白）を設定してテンプレートを作成
     pad = 5
     template_w = note_w
     template_h = note_h
@@ -134,7 +135,7 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 
     rectangles = []
     for pt in zip(*locations[::-1]):
-        # 余白(pad)の分だけ座標を補正し、純粋な音符だけを囲む！
+        # 余白(pad)の分だけ座標を補正し、純粋な音符だけを囲む
         x1 = int(pt[0] + pad)
         y1 = int(pt[1] + pad)
         rect_data = [x1, y1, x1 + template_w, y1 + template_h]
@@ -153,7 +154,7 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
         
         fill_ratio = np.count_nonzero(roi) / roi.size
         
-        # 【新フィルター】スカスカなノイズ(40%未満)と、真っ黒な連桁(90%以上)の両方をカット！
+        # スカスカなノイズ(40%未満)と、真っ黒な連桁(90%以上)の両方をカット
         if 0.40 < fill_ratio < 0.90:
             final_boxes.append([x1, y1, x2, y2])
 
@@ -173,7 +174,7 @@ def calculate_pitch(note_center_y, staves, clefs):
     step_height = (bottom_line_y - top_line_y) / 8.0 
     steps_down = round((note_center_y - top_line_y) / step_height)
     
-    # 【修正2】ショパンの超高音・超低音（加線）に対応できるよう辞書を大幅拡大！
+    # ショパンの超高音・超低音（加線）に対応できるよう辞書を大幅拡大
     if clef == "treble":
         pitch_names = {
             -9: "ラ", -8: "ソ", -7: "ファ", -6: "ミ", -5: "レ", -4: "ド", -3: "シ", -2: "ラ", -1: "ソ", 
@@ -203,7 +204,7 @@ def analyze_score_v2(pil_img, user_threshold):
     staff_space = np.median(np.diff(staff_y_coords))
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
-    # 【大革命】どんなにノイズ線が混じっていても、完璧な5本線の組み合わせだけを抽出し続ける探索ロジック
+    # どんなにノイズ線が混じっていても、完璧な5本線の組み合わせだけを抽出し続ける探索ロジック
     staves = []
     for i in range(len(staff_y_coords)):
         y1 = staff_y_coords[i]
@@ -236,16 +237,18 @@ def analyze_score_v2(pil_img, user_threshold):
     
     try:
         note_h = int(staff_space * 0.9)
+        # NotoSansJP-Regular.ttf が同じディレクトリに配置されていることを確認してください
         font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(14, note_h))
     except IOError:
         font = ImageFont.load_default()
 
     staff_notes = {i: [] for i in range(len(staves))}
     
-    # 【修正】ショパンの超高音に対応するため、マージンをさらに拡大（8加線分まで許可）
+    # ショパンの超高音に対応するため、マージンを拡大（8加線分まで許可）
     margin = staff_space * 8 
     
     img_width = deskewed_pil.size[0]
+    # 画像の横幅の「左から8%」は調号・音部記号エリアとして無視
     ignore_x_zone = int(img_width * 0.08)
     
     for box in picked_boxes:
@@ -301,6 +304,7 @@ def analyze_score_v2(pil_img, user_threshold):
                 tx = top_box[0] - (len(chord_text) * 2) 
                 ty = top_box[1] - note_h - 15
                 
+                # 文字が見やすいように白フチをつける
                 draw.text((tx-1, ty), chord_text, font=font, fill=(255, 255, 255))
                 draw.text((tx+1, ty), chord_text, font=font, fill=(255, 255, 255))
                 draw.text((tx, ty-1), chord_text, font=font, fill=(255, 255, 255))
