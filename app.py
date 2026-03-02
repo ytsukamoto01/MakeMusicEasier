@@ -36,48 +36,32 @@ def detect_staff_lines(pil_img):
     return Image.fromarray(result_img)
 
 
-def detect_note_heads(pil_img):
+# 引数に template_w, template_h, threshold を追加します
+def detect_note_heads(pil_img, template_w, template_h, threshold):
     img_array = np.array(pil_img)
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
 
-    # 1. 二値化（文字や線を白=255、背景を黒=0にする）
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-    # ---------------------------------------------------------
-    # 2. 探すための「おたまじゃくしの型（テンプレート）」を作る
-    # ※ここが一番の調整ポイントです！画像の大きさに合わせて変える必要があります
-    # ---------------------------------------------------------
-    template_w = 24  # 楕円の横幅
-    template_h = 16  # 楕円の縦幅
-    
-    # 真っ黒なキャンバスを作る
+    # 渡されたサイズでテンプレートを作成
     template = np.zeros((template_h + 10, template_w + 10), dtype=np.uint8)
-    
-    # キャンバスの中央に、少し斜め（-20度）に傾けた楕円（おたまじゃくし）を描く
     center = ((template_w + 10) // 2, (template_h + 10) // 2)
     axes = (template_w // 2, template_h // 2)
     cv2.ellipse(template, center, axes, -20, 0, 360, 255, -1)
 
-    # 3. テンプレートマッチングの実行（そっくり度を計算）
     result = cv2.matchTemplate(thresh, template, cv2.TM_CCOEFF_NORMED)
-
-    # 4. 閾値（しきいち）：どれくらい似ていたら「音符だ！」と認めるか（0.0〜1.0）
-    # 厳しすぎると見逃し、緩すぎると文字なども拾ってしまいます
-    threshold_value = 0.65 
     
-    # 似ている場所の座標を取得
-    locations = np.where(result >= threshold_value)
+    # 渡された感度（閾値）を使用
+    locations = np.where(result >= threshold)
 
-    # -- 画面確認用（元の画像に緑色の枠を描く） --
     result_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    h, w = template.shape
+    h_temp, w_temp = template.shape
 
-    # 見つけた場所に緑色の四角を描画
-    for pt in zip(*locations[::-1]): # 座標を(x, y)の順に変換
-        cv2.rectangle(result_img, pt, (pt[0] + w, pt[1] + h), (0, 255, 0), 2)
+    for pt in zip(*locations[::-1]): 
+        cv2.rectangle(result_img, pt, (pt[0] + w_temp, pt[1] + h_temp), (0, 255, 0), 2)
 
     return Image.fromarray(result_img)
 
@@ -86,6 +70,15 @@ st.set_page_config(page_title="ドレミ自動付与ツール", layout="centered
 
 st.title("🎼 楽譜ドレミ自動付与ツール")
 st.write("PDFの楽譜をアップロードすると、自動で音階を解析します。")
+
+# --- UI設定：サイドバーにスライダーを配置 ---
+st.sidebar.header("⚙️ 検出パラメータの調整")
+st.sidebar.write("プレビューを見ながら、音符が綺麗に囲まれるように調整してください。")
+
+# スライダーの作成 (ラベル, 最小値, 最大値, デフォルト値, 刻み幅)
+ui_w = st.sidebar.slider("音符の横幅 (ピクセル)", 5, 50, 24, 1)
+ui_h = st.sidebar.slider("音符の縦幅 (ピクセル)", 5, 50, 16, 1)
+ui_threshold = st.sidebar.slider("検出感度 (低いほど多く検出)", 0.40, 0.95, 0.65, 0.01)
 
 # 1. ファイルアップロード機能
 uploaded_file = st.file_uploader("PDF形式の楽譜を選択してください", type=["pdf"])
@@ -100,18 +93,16 @@ if uploaded_file is not None:
     for i, image in enumerate(images):
         st.image(image, caption=f"{i+1}ページ目", use_column_width=True)
 
-# 3. 画像への書き込み処理
-    with st.spinner('五線を検出中...'):
+    # 3. 画像への書き込み処理 のループ内を以下のように変更
+    with st.spinner('音符を検出中...'):
         processed_images = []
         
         for i, img in enumerate(images):
-            # さっき作ったOpenCVの関数で五線を検出！
-            result_img = detect_note_heads(img) #detect_staff_lines(img)
+            # スライダーの値 (ui_w, ui_h, ui_threshold) を関数に渡す！
+            result_img = detect_note_heads(img, ui_w, ui_h, ui_threshold)
             
             processed_images.append(result_img)
-            
-            # 結果を画面にプレビュー表示
-            st.image(result_img, caption=f"{i+1}ページ目 (五線検出後)", use_column_width=True)
+            st.image(result_img, caption=f"{i+1}ページ目", use_column_width=True)
 
     st.success("処理が完了しました！")
 
