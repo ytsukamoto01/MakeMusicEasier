@@ -1,3 +1,4 @@
 streamlit
 pdf2image
 music21
+Pillow
