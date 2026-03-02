@@ -37,11 +37,12 @@ def detect_staff_lines(pil_img):
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         
-        # 【修正】幅(w)が長く、かつ 高さ(h)が低い（＝まっすぐな細い線）ものだけを残す
-        # ※ h < 15 の数字は画像の解像度によって調整が必要な場合があります。
-        # 厳しすぎる（線が消える）場合は 20 や 30 に、
-        # 緩すぎる（スラーが残る）場合は 10 や 5 に変更してみてください。
-        if w > width // 4 and h < 6.5: 
+        # 輪郭の面積（ピクセル数）を取得
+        area = cv2.contourArea(contour)
+        
+        # 横幅が十分に長く、かつ「平均の太さ (面積 ÷ 横幅)」が細いものだけを残す
+        # ※ 5 の部分は線の太さに合わせて微調整してください（大抵は 2〜5 くらいで収まります）
+        if w > width // 4 and (area / w) < 5: 
             cv2.rectangle(result_img, (x, y), (x + w, y + h), (255, 0, 0), 2) # 赤枠を描画
 
     # OpenCVの画像をPIL画像に戻して返す
