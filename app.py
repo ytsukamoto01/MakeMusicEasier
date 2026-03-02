@@ -42,40 +42,55 @@ def detect_staff_lines_precise(pil_img):
     else:
         gray = img_array
 
+    height, width = gray.shape
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    horizontal_sum = np.sum(thresh, axis=1)
-    peaks = np.where(horizontal_sum > (np.max(horizontal_sum) * 0.25))[0]
-    if len(peaks) < 2: return [], gray, 10
-    
-    diffs = np.diff(peaks)
-    valid_diffs = diffs[diffs > 2]
-    staff_space = np.median(valid_diffs) if len(valid_diffs) > 0 else np.median(diffs)
-    
-    kernel_len = max(5, int(staff_space * 1.5))
+    # 【大改修】完全に水平で長い直線だけを強制的に抽出するフィルター
+    # 画像幅の5%以上の長さを持つ直線要素のみを残し、音符・スラー・文字をすべて消去
+    kernel_len = width // 20 
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
-    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    clean_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+    
+    # 音符の幹（縦線）などで削れてしまった直線の隙間を、横に膨張させて強力に繋ぎ直す
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (width // 10, 1))
+    clean_lines = cv2.dilate(clean_lines, bridge_kernel, iterations=1)
 
-    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 3))
-    horizontal_lines = cv2.dilate(horizontal_lines, bridge_kernel, iterations=1)
-
-    contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 綺麗になった直線だけの画像から座標を取得
+    contours, _ = cv2.findContours(clean_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     staff_y_coords = []
-    width = thresh.shape[1]
+    
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        if w > width // 8: 
+        # 【重要】画像の幅の20%以上の長さを持つ線だけを絶対条件とする
+        if w > width // 5: 
             staff_y_coords.append(int(y + h // 2))
 
     staff_y_coords.sort()
-    return staff_y_coords, gray, staff_space
+
+    # 極端に近すぎる線（1本の太い線が二重に取れた場合）をマージ
+    merged_y = []
+    for y in staff_y_coords:
+        if not merged_y:
+            merged_y.append(y)
+        elif y - merged_y[-1] < 5:
+            merged_y[-1] = int((merged_y[-1] + y) / 2)
+        else:
+            merged_y.append(y)
+
+    # 五線間隔を計算
+    if len(merged_y) >= 2:
+        diffs = np.diff(merged_y)
+        # 異常な間隔を除外した上で中央値をとる
+        valid_diffs = diffs[(diffs > 3) & (diffs < height // 20)]
+        staff_space = np.median(valid_diffs) if len(valid_diffs) > 0 else 10
+    else:
+        staff_space = 10
+
+    return merged_y, gray, staff_space
 
 def non_max_suppression(boxes, overlapThresh):
-    if len(boxes) == 0:
-        return []
-
-    if boxes.dtype.kind == "i":
-        boxes = boxes.astype("float")
+    if len(boxes) == 0: return []
+    if boxes.dtype.kind == "i": boxes = boxes.astype("float")
 
     pick = []
     x1 = boxes[:,0]
@@ -100,9 +115,7 @@ def non_max_suppression(boxes, overlapThresh):
         h = np.maximum(0, yy2 - yy1 + 1)
 
         overlap = (w * h) / area[idxs[:last]]
-
-        idxs = np.delete(idxs, np.concatenate(([last],
-            np.where(overlap > overlapThresh)[0])))
+        idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlapThresh)[0])))
 
     return boxes[pick].astype("int")
 
@@ -133,8 +146,7 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
         y1 = int(pt[1] + pad)
         rectangles.append([x1, y1, x1 + template_w, y1 + template_h])
 
-    if not rectangles:
-        return []
+    if not rectangles: return []
 
     boxes = np.array(rectangles)
     picked_boxes = non_max_suppression(boxes, overlapThresh=0.4)
@@ -143,7 +155,6 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     for (x1, y1, x2, y2) in picked_boxes:
         roi = thresh[y1:y2, x1:x2]
         if roi.size == 0: continue
-        
         fill_ratio = np.count_nonzero(roi) / roi.size
         if 0.35 < fill_ratio < 0.95:
             final_boxes.append([x1, y1, x2, y2])
@@ -179,7 +190,7 @@ def calculate_pitch(note_center_y, staves, clefs):
     return pitch_names.get(steps_down, None)
 
 # ==========================================
-# 解析マスター関数 V2 (高精度版・デバッグモード)
+# 解析マスター関数 V2 (デバッグモード)
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
@@ -191,6 +202,7 @@ def analyze_score_v2(pil_img, user_threshold):
 
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
+    # 近接線の最終整理
     merged_y_coords = []
     for y in staff_y_coords:
         if not merged_y_coords:
@@ -200,11 +212,11 @@ def analyze_score_v2(pil_img, user_threshold):
         else:
             merged_y_coords.append(y)
 
+    # シンプルな5本線抽出
     possible_staves = []
     for i in range(len(merged_y_coords) - 4):
         staff_lines = merged_y_coords[i:i+5]
         gaps = np.diff(staff_lines)
-        
         if np.all((gaps > staff_space * 0.7) & (gaps < staff_space * 1.3)):
             possible_staves.append(staff_lines)
             
@@ -216,25 +228,20 @@ def analyze_score_v2(pil_img, user_threshold):
             if staff_lines[0] > staves[-1][4] + staff_space * 2:
                 staves.append(staff_lines)
 
-    # 描画準備
-    result_pil = deskewed_pil.copy()
-    result_pil = result_pil.convert("RGB")
+    result_pil = deskewed_pil.copy().convert("RGB")
     draw = ImageDraw.Draw(result_pil)
     img_width = result_pil.size[0]
 
     # --- 🛠️ デバッグ用可視化 🛠️ ---
-    # 1. 検出された全ての水平線（薄い赤）
     for y in merged_y_coords:
         draw.line([(0, y), (img_width, y)], fill=(255, 150, 150), width=1)
         
-    # 2. 最終的に五線として確定した線（青）
     for staff in staves:
         for y in staff:
             draw.line([(0, y), (img_width, y)], fill=(50, 50, 255), width=2)
     # ------------------------------
 
-    if not staves:
-        return result_pil
+    if not staves: return result_pil
 
     clefs = ["treble" if i % 2 == 0 else "bass" for i in range(len(staves))]
     
@@ -246,12 +253,10 @@ def analyze_score_v2(pil_img, user_threshold):
 
     staff_notes = {i: [] for i in range(len(staves))}
     margin = staff_space * 8 
-    
     ignore_x_zone = int(img_width * 0.08)
     
     for box in picked_boxes:
-        if box[0] < ignore_x_zone:
-            continue
+        if box[0] < ignore_x_zone: continue
             
         note_center_y = int((box[1] + box[3]) / 2)
         distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
@@ -277,8 +282,7 @@ def analyze_score_v2(pil_img, user_threshold):
                 else:
                     chords.append(current_chord)
                     current_chord = [box]
-        if current_chord:
-            chords.append(current_chord)
+        if current_chord: chords.append(current_chord)
 
         for chord in chords:
             chord.sort(key=lambda b: b[1])
@@ -297,7 +301,6 @@ def analyze_score_v2(pil_img, user_threshold):
                         unique_pitches.append(p)
                 
                 chord_text = "".join(unique_pitches)
-                
                 top_box = chord[0]
                 tx = top_box[0] - (len(chord_text) * 2) 
                 ty = top_box[1] - note_h - 15
@@ -316,7 +319,6 @@ def analyze_score_v2(pil_img, user_threshold):
 
 st.set_page_config(page_title="ドレミ自動付与ツール V2 (デバッグ版)", layout="centered")
 st.title("🎼 楽譜ドレミ自動付与ツール V2 (デバッグ版)")
-st.write("認識された線を赤色・青色で可視化します。")
 
 st.sidebar.header("⚙️ 検出パラメータの調整")
 ui_threshold = st.sidebar.slider("検出感度 (低いほど多く検出)", 0.40, 0.95, 0.65, 0.01)
@@ -325,7 +327,6 @@ uploaded_file = st.file_uploader("PDF形式の楽譜を選択してください"
 
 if uploaded_file is not None:
     st.success("ファイルを受け取りました！解析を開始します...")
-
     images = convert_from_bytes(uploaded_file.read())
     
     with st.spinner('音符を解析中...'):
@@ -338,14 +339,5 @@ if uploaded_file is not None:
     st.success("処理が完了しました！線の認識状況を確認してください。")
 
     pdf_byte_arr = io.BytesIO()
-    processed_images[0].save(
-        pdf_byte_arr, format='PDF', 
-        save_all=True, append_images=processed_images[1:]
-    )
-    
-    st.download_button(
-        label="デバッグ版画像をダウンロード",
-        data=pdf_byte_arr.getvalue(),
-        file_name="debug_score.pdf",
-        mime="application/pdf"
-    )
+    processed_images[0].save(pdf_byte_arr, format='PDF', save_all=True, append_images=processed_images[1:])
+    st.download_button(label="デバッグ版画像をダウンロード", data=pdf_byte_arr.getvalue(), file_name="debug_score.pdf", mime="application/pdf")
