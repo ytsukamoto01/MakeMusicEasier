@@ -147,8 +147,8 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 
 def calculate_pitch(note_center_y, staves, clefs):
     """音符のY座標と音部記号（ト音/ヘ音）から音階を正しく計算する"""
+    if not staves: return None
     
-    # 一番近い「段（5本線のグループ）」とその記号を探す
     distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
     closest_idx = int(np.argmin(distances))
     closest_staff = staves[closest_idx]
@@ -159,33 +159,28 @@ def calculate_pitch(note_center_y, staves, clefs):
     step_height = (bottom_line_y - top_line_y) / 8.0 
     steps_down = round((note_center_y - top_line_y) / step_height)
     
-    if steps_down < -4 or steps_down > 16:
-        return None
-        
+    # 【修正2】ショパンの超高音・超低音（加線）に対応できるよう辞書を大幅拡大！
     if clef == "treble":
-        # 【修正】ト音記号（下に移動するほど音が下がるように反転）
         pitch_names = {
-            -4: "ド", -3: "シ", -2: "ラ", -1: "ソ", 0: "ファ", 1: "ミ", 2: "レ", 3: "ド", 
-            4: "シ", 5: "ラ", 6: "ソ", 7: "ファ", 8: "ミ", 9: "レ",
-            10: "ド", 11: "シ", 12: "ラ", 13: "ソ", 14: "ファ"
+            -9: "ラ", -8: "ソ", -7: "ファ", -6: "ミ", -5: "レ", -4: "ド", -3: "シ", -2: "ラ", -1: "ソ", 
+            0: "ファ", 1: "ミ", 2: "レ", 3: "ド", 4: "シ", 5: "ラ", 6: "ソ", 7: "ファ", 
+            8: "ミ", 9: "レ", 10: "ド", 11: "シ", 12: "ラ", 13: "ソ", 14: "ファ", 15: "ミ", 16: "レ"
         }
     else:
-        # 【修正】ヘ音記号（下に移動するほど音が下がるように反転）
         pitch_names = {
-            -4: "ミ", -3: "レ", -2: "ド", -1: "シ", 0: "ラ", 1: "ソ", 2: "ファ", 3: "ミ",
-            4: "レ", 5: "ド", 6: "シ", 7: "ラ", 8: "ソ", 9: "ファ",
-            10: "ミ", 11: "レ", 12: "ド", 13: "シ", 14: "ラ"
+            -9: "ド", -8: "シ", -7: "ラ", -6: "ソ", -5: "ファ", -4: "ミ", -3: "レ", -2: "ド", -1: "シ", 
+            0: "ラ", 1: "ソ", 2: "ファ", 3: "ミ", 4: "レ", 5: "ド", 6: "シ", 7: "ラ", 
+            8: "ソ", 9: "ファ", 10: "ミ", 11: "レ", 12: "ド", 13: "シ", 14: "ラ", 15: "ソ", 16: "ファ"
         }
         
-    return pitch_names.get(steps_down, "?")
+    return pitch_names.get(steps_down, None)
 
 # ==========================================
 # 解析マスター関数 V2 (高精度版)
 # ==========================================
 
 def analyze_score_v2(pil_img, user_threshold):
-    """高精度版解析関数（和音＆ヘ音記号対応・修正版）"""
-    
+    """高精度版解析関数（バグ修正・完成版）"""
     deskewed_pil = deskew(pil_img)
     staff_y_coords, gray_img = detect_staff_lines_precise(deskewed_pil)
     
@@ -195,10 +190,17 @@ def analyze_score_v2(pil_img, user_threshold):
     staff_space = np.median(np.diff(staff_y_coords))
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
+    # 【修正1】五線の重複登録を防ぐ堅牢なロジック！
     staves = []
-    for i in range(0, len(staff_y_coords) - 4):
-        if staff_y_coords[i+4] - staff_y_coords[i] < staff_space * 5: 
+    i = 0
+    while i <= len(staff_y_coords) - 5:
+        height = staff_y_coords[i+4] - staff_y_coords[i]
+        # 5本線の幅が正常（間隔の3〜5倍）なら段として登録し、次の5本へスキップ
+        if staff_space * 3 < height < staff_space * 5: 
             staves.append(staff_y_coords[i:i+5])
+            i += 5 
+        else:
+            i += 1
             
     if not staves:
         return deskewed_pil
@@ -215,7 +217,6 @@ def analyze_score_v2(pil_img, user_threshold):
     except IOError:
         font = ImageFont.load_default()
 
-    # 【新修正】まずは音符を「どの段（右手・左手）」に属しているかで分ける！
     staff_notes = {i: [] for i in range(len(staves))}
     for box in picked_boxes:
         note_center_y = int((box[1] + box[3]) / 2)
@@ -223,12 +224,9 @@ def analyze_score_v2(pil_img, user_threshold):
         closest_idx = int(np.argmin(distances))
         staff_notes[closest_idx].append(box)
 
-    # 各段ごとに独立して和音の処理を行う
     for staff_idx, notes in staff_notes.items():
-        if not notes:
-            continue
+        if not notes: continue
             
-        # X座標で左から右へ並び替え
         notes = sorted(notes, key=lambda b: b[0])
         chords = []
         current_chord = []
@@ -237,9 +235,8 @@ def analyze_score_v2(pil_img, user_threshold):
             if not current_chord:
                 current_chord.append(box)
             else:
-                # 【新修正】同じ段の中で、横幅がピッタリくっついているものだけを和音とする
-                # 閾値を staff_space * 1.2 に狭め、隣の細かいメロディを巻き込まないようにしました
-                if abs(box[0] - current_chord[0][0]) < (staff_space * 1.2):
+                # 【修正3】フラット記号などを和音に巻き込まないよう、重なり判定を厳格化
+                if abs(box[0] - current_chord[-1][0]) < (staff_space * 0.8):
                     current_chord.append(box)
                 else:
                     chords.append(current_chord)
@@ -247,11 +244,8 @@ def analyze_score_v2(pil_img, user_threshold):
         if current_chord:
             chords.append(current_chord)
 
-        # 和音ごとに処理して書き込む
         for chord in chords:
-            # Y座標で上から下へ並び替え（高い音から順に文字にするため）
             chord.sort(key=lambda b: b[1])
-            
             pitches = []
             for (x1, y1, x2, y2) in chord:
                 note_center_y = int((y1 + y2) / 2)
@@ -261,7 +255,6 @@ def analyze_score_v2(pil_img, user_threshold):
                     draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
             
             if pitches:
-                # 重複した音名（微小な誤検出）を省く
                 unique_pitches = []
                 for p in pitches:
                     if not unique_pitches or unique_pitches[-1] != p:
@@ -269,17 +262,14 @@ def analyze_score_v2(pil_img, user_threshold):
                 
                 chord_text = "".join(unique_pitches)
                 
-                # 一番上の音符の少し上にまとめてテキストを描画
                 top_box = chord[0]
                 tx = top_box[0] - (len(chord_text) * 2) 
                 ty = top_box[1] - note_h - 15
                 
-                # 白フチをつける
                 draw.text((tx-1, ty), chord_text, font=font, fill=(255, 255, 255))
                 draw.text((tx+1, ty), chord_text, font=font, fill=(255, 255, 255))
                 draw.text((tx, ty-1), chord_text, font=font, fill=(255, 255, 255))
                 draw.text((tx, ty+1), chord_text, font=font, fill=(255, 255, 255))
-                # 本体の赤文字
                 draw.text((tx, ty), chord_text, font=font, fill=(255, 0, 0))
 
     return result_pil
