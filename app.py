@@ -10,17 +10,14 @@ from pdf2image import convert_from_bytes
 # ==========================================
 
 def deskew(pil_img):
-    """画像のわずかな傾きを補正して、五線を水平にする"""
     img_array = np.array(pil_img)
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
     
-    # 二値化（背景を黒、コンテンツを白にする）
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # コンテンツの輪郭から傾き角度を計算
     coords = np.column_stack(np.where(thresh > 0))
     if len(coords) == 0:
         return pil_img
@@ -31,7 +28,6 @@ def deskew(pil_img):
     else:
         angle = -angle
         
-    # 回転を実行
     (h, w) = img_array.shape[:2]
     center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -40,7 +36,6 @@ def deskew(pil_img):
     return Image.fromarray(rotated)
 
 def detect_staff_lines_precise(pil_img):
-    """五線を高精度に検出し、そのY座標と五線間隔を返す"""
     img_array = np.array(pil_img)
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
@@ -49,39 +44,35 @@ def detect_staff_lines_precise(pil_img):
 
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 横方向のオープニングで、五線だけを抽出
     horizontal_sum = np.sum(thresh, axis=1)
+    peaks = np.where(horizontal_sum > (np.max(horizontal_sum) * 0.25))[0]
+    if len(peaks) < 2: return [], gray, 10
     
-    # 【修正1】0.5 -> 0.3 に緩和。太い小節線などに引っ張られて右手の細い線が消えるのを防ぐ
-    peaks = np.where(horizontal_sum > (np.max(horizontal_sum) * 0.3))[0]
-    if len(peaks) < 2: return [], gray, 10 # 見つからない場合のフォールバック
-    
-    # 五線の間隔を正確に推定（連続する太い線のピクセルを除外）
     diffs = np.diff(peaks)
     valid_diffs = diffs[diffs > 2]
     staff_space = np.median(valid_diffs) if len(valid_diffs) > 0 else np.median(diffs)
     
-    # 五線間隔の2倍の長さの横棒フィルター
-    kernel_len = int(staff_space * 2)
+    # 歪み・かすれ対策：短めのカーネルで開き、後で横に膨張させて線を繋げる
+    kernel_len = max(5, int(staff_space * 1.5))
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
     horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
 
-    # 抽出された五線画像から、Y座標を正確に取得
+    bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 3))
+    horizontal_lines = cv2.dilate(horizontal_lines, bridge_kernel, iterations=1)
+
     contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     staff_y_coords = []
     width = thresh.shape[1]
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        # 【修正2】 width // 2 -> width // 4 に緩和。
-        # 曲の開始時など、右手が大きく段下げ（インデント）されている場合でも拾えるようにする
-        if w > width // 4: 
-            staff_y_coords.append(int(y + h // 2)) # 中心Y座標
+        # 画像幅の1/8以上あれば五線候補（スラーなども拾うが後で弾く）
+        if w > width // 8: 
+            staff_y_coords.append(int(y + h // 2))
 
-    staff_y_coords.sort() # 上から順に並べる
+    staff_y_coords.sort()
     return staff_y_coords, gray, staff_space
 
 def non_max_suppression(boxes, overlapThresh):
-    """カスタムNon-Maximum Suppression実装"""
     if len(boxes) == 0:
         return []
 
@@ -120,16 +111,15 @@ def non_max_suppression(boxes, overlapThresh):
 def detect_note_heads_precise(gray_img, staff_space, user_threshold):
     _, thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 削りすぎないよう少し優しめに設定
-    k_size = max(2, int(staff_space * 0.45)) 
+    k_size = max(2, int(staff_space * 0.4)) 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
     note_w = int(staff_space * 1.2)
     note_h = int(staff_space * 0.9)
     
-    # 【大バグ修正！】パッド（余白）のズレを修正
-    pad = 5
+    # 【最重要修正】余白(pad)を最小化。密集した音符同士が干渉して検出漏れするのを防ぐ
+    pad = 2
     template_w = note_w
     template_h = note_h
     template = np.zeros((template_h + pad*2, template_w + pad*2), dtype=np.uint8)
@@ -142,17 +132,16 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
 
     rectangles = []
     for pt in zip(*locations[::-1]):
-        # 余白(pad)の分だけ座標を補正し、純粋な音符だけを囲む！
         x1 = int(pt[0] + pad)
         y1 = int(pt[1] + pad)
-        rect_data = [x1, y1, x1 + template_w, y1 + template_h]
-        rectangles.append(rect_data)
+        rectangles.append([x1, y1, x1 + template_w, y1 + template_h])
 
     if not rectangles:
         return []
 
     boxes = np.array(rectangles)
-    picked_boxes = non_max_suppression(boxes, overlapThresh=0.3)
+    # 密集地帯に対応するためNMS閾値を少し緩和
+    picked_boxes = non_max_suppression(boxes, overlapThresh=0.4)
 
     final_boxes = []
     for (x1, y1, x2, y2) in picked_boxes:
@@ -160,15 +149,13 @@ def detect_note_heads_precise(gray_img, staff_space, user_threshold):
         if roi.size == 0: continue
         
         fill_ratio = np.count_nonzero(roi) / roi.size
-        
-        # 【新フィルター】スカスカなノイズ(40%未満)と、真っ黒な連桁(90%以上)の両方をカット！
-        if 0.40 < fill_ratio < 0.90:
+        # 密集した音符の「真っ黒」判定を95%まで緩和
+        if 0.35 < fill_ratio < 0.95:
             final_boxes.append([x1, y1, x2, y2])
 
     return final_boxes
 
 def calculate_pitch(note_center_y, staves, clefs):
-    """音符のY座標と音部記号（ト音/ヘ音）から音階を正しく計算する"""
     if not staves: return None
     
     distances = [abs(np.mean(staff) - note_center_y) for staff in staves]
@@ -181,7 +168,6 @@ def calculate_pitch(note_center_y, staves, clefs):
     step_height = (bottom_line_y - top_line_y) / 8.0 
     steps_down = round((note_center_y - top_line_y) / step_height)
     
-    # 【修正2】ショパンの超高音・超低音（加線）に対応できるよう辞書を大幅拡大！
     if clef == "treble":
         pitch_names = {
             -9: "ラ", -8: "ソ", -7: "ファ", -6: "ミ", -5: "レ", -4: "ド", -3: "シ", -2: "ラ", -1: "ソ", 
@@ -203,7 +189,6 @@ def calculate_pitch(note_center_y, staves, clefs):
 
 def analyze_score_v2(pil_img, user_threshold):
     deskewed_pil = deskew(pil_img)
-    # 【修正】staff_spaceも戻り値として直接受け取る
     staff_y_coords, gray_img, staff_space = detect_staff_lines_precise(deskewed_pil)
     
     if not staff_y_coords or len(staff_y_coords) < 5:
@@ -211,46 +196,47 @@ def analyze_score_v2(pil_img, user_threshold):
 
     picked_boxes = detect_note_heads_precise(gray_img, staff_space, user_threshold)
 
-    # 【修正3】線のY座標を近いもの同士で平均化（かすれ等により1本の線が二重に検出され、カウントがズレるのを防ぐ）
     merged_y_coords = []
     for y in staff_y_coords:
         if not merged_y_coords:
             merged_y_coords.append(y)
-        elif y - merged_y_coords[-1] < staff_space * 0.4:
-            # 近すぎる線は同じ線とみなして平均化
+        elif y - merged_y_coords[-1] < staff_space * 0.5:
             merged_y_coords[-1] = int((merged_y_coords[-1] + y) / 2)
         else:
             merged_y_coords.append(y)
 
-    # 【大革命】どんなにノイズ線が混じっていても、完璧な5本線の組み合わせだけを抽出し続ける探索ロジック
+    # 【新革命】スラー等のノイズ線に騙されない！「最も等間隔な5本線」だけを厳選するスコアリング方式
+    possible_staves = []
+    for i in range(len(merged_y_coords) - 4):
+        staff_lines = merged_y_coords[i:i+5]
+        gaps = np.diff(staff_lines)
+        
+        if np.all((gaps > staff_space * 0.7) & (gaps < staff_space * 1.3)):
+            variance = np.var(gaps) # 間隔のバラつき具合（低いほど綺麗）
+            possible_staves.append((variance, staff_lines))
+    
+    possible_staves.sort(key=lambda x: x[1][0])
+    
     staves = []
-    for i in range(len(merged_y_coords)):
-        y1 = merged_y_coords[i]
-        
-        # すでに登録済みの段と被る場合はスキップ
-        if staves and y1 < staves[-1][4] + staff_space * 2:
-            continue
-        
-        current_staff = [y1]
-        last_y = y1
-        for j in range(i+1, len(merged_y_coords)):
-            yj = merged_y_coords[j]
-            gap = yj - last_y
-            
-            # 次の線が、五線間隔の許容範囲内なら追加
-            if staff_space * 0.6 < gap < staff_space * 1.4:
-                current_staff.append(yj)
-                last_y = yj
-            elif gap >= staff_space * 1.4:
-                # 【追加】もし間隔が開きすぎたら、それは次の段の線の可能性が高いのでブレイク
-                break
+    current_overlap_group = []
+    
+    for item in possible_staves:
+        if not current_overlap_group:
+            current_overlap_group.append(item)
+        else:
+            # 前の候補とY座標が被っている場合（スラー混入などによる重複候補）
+            if item[1][0] < current_overlap_group[-1][1][4]:
+                current_overlap_group.append(item)
+            else:
+                # 重複グループの中で、一番分散が小さい（＝最も等間隔な）本物の5本線を採用
+                best_staff = min(current_overlap_group, key=lambda x: x[0])[1]
+                staves.append(best_staff)
+                current_overlap_group = [item]
                 
-            if len(current_staff) == 5:
-                break
-        
-        if len(current_staff) == 5:
-            staves.append(current_staff)
-            
+    if current_overlap_group:
+        best_staff = min(current_overlap_group, key=lambda x: x[0])[1]
+        staves.append(best_staff)
+
     if not staves:
         return deskewed_pil
 
@@ -267,8 +253,6 @@ def analyze_score_v2(pil_img, user_threshold):
         font = ImageFont.load_default()
 
     staff_notes = {i: [] for i in range(len(staves))}
-    
-    # 【修正】ショパンの超高音に対応するため、マージンをさらに拡大（8加線分まで許可）
     margin = staff_space * 8 
     
     img_width = deskewed_pil.size[0]
@@ -339,53 +323,37 @@ def analyze_score_v2(pil_img, user_threshold):
 # Streamlit アプリケーション UI
 # ==========================================
 
-# ページの設定
 st.set_page_config(page_title="ドレミ自動付与ツール V2", layout="centered")
-
 st.title("🎼 楽譜ドレミ自動付与ツール V2")
 st.write("PDFの楽譜をアップロードすると、自動で音階を解析します（高精度版）。")
 
-# --- UI設定：サイドバー ---
 st.sidebar.header("⚙️ 検出パラメータの調整")
 st.sidebar.write("プレビューを見ながら、音符が綺麗に囲まれるように感度を調整してください。")
-
-# 感度（閾値）のスライダーだけを残す
 ui_threshold = st.sidebar.slider("検出感度 (低いほど多く検出)", 0.40, 0.95, 0.65, 0.01)
-# 音符サイズの自動推定をユーザーに伝える
 st.sidebar.info("音符のサイズは楽譜の五線間隔から自動で推定されます。")
 
-# 1. ファイルアップロード機能
 uploaded_file = st.file_uploader("PDF形式の楽譜を選択してください", type=["pdf"])
 
 if uploaded_file is not None:
     st.success("ファイルを受け取りました！解析を開始します...")
 
-    # 2. PDFを表示用に画像変換
-    # ※ poppler のインストールが必要です
     images = convert_from_bytes(uploaded_file.read())
     
-    # 3. 解析ロジックの呼び出し
     with st.spinner('音符を解析中...'):
         processed_images = []
-        
         for i, img in enumerate(images):
-            # 高精度版解析関数を呼び出す
             result_img = analyze_score_v2(img, ui_threshold)
-            
             processed_images.append(result_img)
-            # 画面にもプレビュー表示
             st.image(result_img, caption=f"{i+1}ページ目", use_column_width=True)
 
     st.success("処理が完了しました！")
 
-    # 4. 処理結果をPDFとしてまとめる
     pdf_byte_arr = io.BytesIO()
     processed_images[0].save(
         pdf_byte_arr, format='PDF', 
         save_all=True, append_images=processed_images[1:]
     )
     
-    # ダウンロードボタン
     st.download_button(
         label="ドレミ付き楽譜をダウンロード",
         data=pdf_byte_arr.getvalue(),
