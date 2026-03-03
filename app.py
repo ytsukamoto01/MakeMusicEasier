@@ -73,7 +73,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     # 五線の太さを推定 (通常 staff_space の 1/10 程度)
     line_thickness = max(1, int(staff_space * 0.12))
     # 五線の3倍以上の太さがあるものを抽出するためのカーネル
-    thick_k_size = int(line_thickness * 3)
+    thick_k_size = int(line_thickness * 10)
     thick_k = cv2.getStructuringElement(cv2.MORPH_RECT, (thick_k_size, thick_k_size))
     # オープニング処理で細い線（五線）を消し、太い部分だけ残す
     thick_elements = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, thick_k)
