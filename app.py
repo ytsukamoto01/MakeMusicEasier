@@ -10,7 +10,6 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # ==========================================
 # 1. 楽譜解析エンジン (V8 ロジック)
 # ==========================================
-
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
     _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -106,7 +105,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     return nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
 
-# 【変更点】引数から flats_count を削除し、純粋な音階のみを返すようにしました
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
     step_size = abs(line1 - line5) / 8.0
@@ -118,9 +116,9 @@ def get_pitch_name(note_y, staff, clef):
     return mapping.get(steps, "")
 
 # ==========================================
-# 2. 描画・キャッシュ処理
+# 2. 描画・キャッシュ処理 (Stepごとの表示に対応)
 # ==========================================
-def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space):
+def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
     
@@ -133,50 +131,60 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
     drawn_text_rects = []
 
     def draw_label(x, yc, is_custom=False):
+        # 基本の音階を計算
         s_idx = np.argmin([abs(np.mean(s) - yc) for s in staves])
         clef = "treble" if s_idx % 2 == 0 else "bass"
         p_name = get_pitch_name(yc, staves[s_idx], clef)
         
-        if p_name:
-            box_color = (255, 165, 0) if is_custom else (0, 255, 0)
+        # ユーザーがStep3でマニュアル修正している場合は上書き
+        lbl_key = (int(x), int(yc))
+        if lbl_key in custom_labels:
+            p_name = custom_labels[lbl_key]
+        
+        # Step4のプレビュー時は、テキストが空なら何も描画しない
+        if p_name or not hide_boxes:
             hw, hh = int(space * 0.6), int(space * 0.5)
             b = [x - hw, yc - hh, x + hw, yc + hh]
-            draw.rectangle(b, outline=box_color, width=2)
             
-            # 【変更点】文字色をすべて赤（255, 0, 0）に固定
-            color = (255, 0, 0)
-            
-            text_x = b[0]
-            text_y = b[1] - int(space * 1.6)
-            
-            text_w = len(p_name) * font_size
-            text_h = font_size
-            
-            while True:
-                is_overlapping = False
-                for (rx, ry, rw, rh) in drawn_text_rects:
-                    if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
-                        is_overlapping = True
-                        break
-                
-                if is_overlapping:
-                    text_x += int(font_size * 1.1)
+            # 枠線の描画（Step4以外）
+            if not hide_boxes:
+                box_color = (255, 165, 0) if is_custom else (0, 255, 0)
+                # 選択中の音符は太い青枠にする
+                if selected_pos and math.hypot(x - selected_pos[0], yc - selected_pos[1]) < 2:
+                    draw.rectangle(b, outline=(0, 0, 255), width=4)
                 else:
-                    break
+                    draw.rectangle(b, outline=box_color, width=2)
+            
+            if p_name:
+                color = (255, 0, 0)
+                text_x = b[0]
+                text_y = b[1] - int(space * 1.6)
+                text_w = len(p_name) * font_size
+                text_h = font_size
+                
+                # 和音などの文字被り防止
+                while True:
+                    is_overlapping = False
+                    for (rx, ry, rw, rh) in drawn_text_rects:
+                        if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
+                            is_overlapping = True
+                            break
+                    if is_overlapping:
+                        text_x += int(font_size * 1.1)
+                    else:
+                        break
 
-            draw.text((text_x, text_y), p_name, font=font, fill=color)
-            drawn_text_rects.append((text_x, text_y, text_w, text_h))
+                draw.text((text_x, text_y), p_name, font=font, fill=color)
+                drawn_text_rects.append((text_x, text_y, text_w, text_h))
 
+    # 自動検出分の描画
     for box in auto_notes:
         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-        is_deleted = False
-        for dx, dy in deleted_auto:
-            if math.hypot(cx - dx, cy - dy) < 1.0:
-                is_deleted = True
-                break
+        is_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
         if not is_deleted:
             draw_label(cx, cy, False)
 
+    # 手動追加分の描画
     for (cx, yc) in custom_clicks:
         draw_label(cx, yc, True)
         
@@ -193,82 +201,226 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
     return data
 
 # ==========================================
-# 3. Streamlit UI
+# 3. Streamlit UI (ウィザード形式)
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
+
+# セッションステートの初期化
+if "step" not in st.session_state: st.session_state.step = 1
+if "custom_clicks" not in st.session_state: st.session_state.custom_clicks = {}
+if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_notes = {}
+if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} # {page_idx: {(x, y): "label"}}
+if "selected_note" not in st.session_state: st.session_state.selected_note = None # {"page": i, "x": x, "y": y, "label": label}
+if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
+
+# ステップ移動用の関数
+def next_step(): st.session_state.step += 1
+def prev_step(): st.session_state.step -= 1
+
 st.title("🎼 ドレミ付与ツール V8")
-st.info("💡 **操作方法:** 検出漏れの場所をクリックすると追加されます。すでにある音符（枠線）の近くをクリックすると削除されます。")
 
-if "custom_clicks" not in st.session_state:
-    st.session_state.custom_clicks = {}
-if "deleted_auto_notes" not in st.session_state:
-    st.session_state.deleted_auto_notes = {}
+# ステップナビゲーションバー
+steps = ["1. アップロード", "2. ワンクリック調整", "3. マニュアル微調整", "4. プレビュー＆保存"]
+cols = st.columns(4)
+for i, step_name in enumerate(steps):
+    if st.session_state.step == i + 1:
+        cols[i].markdown(f"**🔵 {step_name}**")
+    else:
+        cols[i].markdown(f"⚪ {step_name}")
+st.divider()
 
-st.sidebar.header("⚙️ 設定")
-# 【変更点】調号のセレクトボックスを削除しました
-ui_sens = st.sidebar.slider("検出感度", 1, 100, 50)
-internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
+# サイドバー設定
+st.sidebar.header("⚙️ 表示設定")
 disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800)
+if st.session_state.step == 1:
+    ui_sens = st.sidebar.slider("初期の検出感度", 1, 100, 50)
+    st.session_state.internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
 
-up = st.file_uploader("PDFをアップロード", type="pdf")
-if up:
-    pages = process_pdf_and_detect(up.read(), internal_threshold)
+# ==========================================
+# STEP 1: アップロード
+# ==========================================
+if st.session_state.step == 1:
+    st.subheader("Step 1: 楽譜PDFをアップロード")
+    up = st.file_uploader("PDFファイルを選択してください", type="pdf")
+    
+    if up:
+        st.session_state.pdf_data = up.getvalue()
+        st.success("PDFを読み込みました！次へ進んでください。")
+        st.button("次へ ➡️", on_click=next_step, type="primary")
+
+# PDFデータがある場合、解析結果を取得
+if st.session_state.pdf_data:
+    pages = process_pdf_and_detect(st.session_state.pdf_data, st.session_state.get("internal_threshold", 0.65))
+else:
+    pages = []
+
+# ==========================================
+# STEP 2: ワンクリック自動調整
+# ==========================================
+if st.session_state.step == 2:
+    col1, col2 = st.columns([1, 1])
+    col1.subheader("Step 2: ワンクリック調整")
+    col1.info("💡 **操作:** 検出漏れの場所をクリックで追加。既存の音符の近くをクリックで削除。")
+    col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
+    col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
+
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
-            clicks = st.session_state.custom_clicks.get(i, [])
-            deleted_auto = st.session_state.deleted_auto_notes.get(i, [])
+            clicks = st.session_state.custom_clicks.setdefault(i, [])
+            deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
             
-            # 【変更点】引数から flats を削除しました
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"])
+            # 描画
+            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], st.session_state.custom_labels.get(i, {}))
+            value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=disp_width)
             
-            value = streamlit_image_coordinates(res_img, key=f"img_{i}", width=disp_width)
-            
-            last_click_key = f"last_click_{i}"
-            if last_click_key not in st.session_state:
-                st.session_state[last_click_key] = None
+            # クリック処理 (無限ループ防止)
+            last_click_key = f"s2_last_click_{i}"
+            if last_click_key not in st.session_state: st.session_state[last_click_key] = None
             
             if value and value != st.session_state[last_click_key]:
                 st.session_state[last_click_key] = value
-                
-                clicked_x, clicked_y = value["x"], value["y"]
                 scale = page["image"].width / disp_width
-                real_x, real_y = clicked_x * scale, clicked_y * scale
-                
+                real_x, real_y = value["x"] * scale, value["y"] * scale
                 click_threshold = page["space"] * 1.5 
                 action_taken = False
 
                 for pt in clicks.copy():
                     if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
                         clicks.remove(pt)
-                        st.session_state.custom_clicks[i] = clicks
                         action_taken = True
                         break
 
                 if not action_taken:
                     for box in page["notes"]:
                         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                        is_already_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
-                        if not is_already_deleted and math.hypot(real_x - cx, real_y - cy) < click_threshold:
-                            if i not in st.session_state.deleted_auto_notes:
-                                st.session_state.deleted_auto_notes[i] = []
-                            st.session_state.deleted_auto_notes[i].append((cx, cy))
-                            action_taken = True
-                            break
+                        if not any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto):
+                            if math.hypot(real_x - cx, real_y - cy) < click_threshold:
+                                deleted_auto.append((cx, cy))
+                                action_taken = True
+                                break
 
                 if not action_taken:
-                    if i not in st.session_state.custom_clicks: 
-                        st.session_state.custom_clicks[i] = []
-                    st.session_state.custom_clicks[i].append((real_x, real_y))
-                
+                    clicks.append((real_x, real_y))
                 st.rerun() 
         else:
             st.image(page["image"], width=disp_width)
 
-    if st.button("手動編集をすべてリセット"):
-        st.session_state.custom_clicks = {}
-        st.session_state.deleted_auto_notes = {}
-        for key in list(st.session_state.keys()):
-            if key.startswith("last_click_"):
-                del st.session_state[key]
-        st.rerun()
+# ==========================================
+# STEP 3: マニュアル微調整
+# ==========================================
+if st.session_state.step == 3:
+    col1, col2 = st.columns([1, 1])
+    col1.subheader("Step 3: マニュアル微調整")
+    col1.info("💡 **操作:** 音符をクリックして選択し、下の入力欄で「ドレミ」を自由に変更できます。何もない場所をクリックすると新しく音符を追加できます。")
+    col2.button("次へ：完成プレビュー ➡️", on_click=next_step, type="primary")
+    col2.button("⬅️ 戻る (Step 2へ)", on_click=prev_step)
+
+    for i, page in enumerate(pages):
+        st.write(f"### ページ {i + 1}")
+        if page["staves"]:
+            clicks = st.session_state.custom_clicks.get(i, [])
+            deleted_auto = st.session_state.deleted_auto_notes.get(i, [])
+            custom_labels_page = st.session_state.custom_labels.setdefault(i, {})
+            
+            # 選択中の音符の座標を取得
+            sel_pos = None
+            if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
+                sel_pos = (st.session_state.selected_note["x"], st.session_state.selected_note["y"])
+
+            # 描画
+            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], custom_labels_page, selected_pos=sel_pos)
+            value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=disp_width)
+            
+            # 音符選択/追加のロジック
+            last_click_key = f"s3_last_click_{i}"
+            if last_click_key not in st.session_state: st.session_state[last_click_key] = None
+            
+            if value and value != st.session_state[last_click_key]:
+                st.session_state[last_click_key] = value
+                scale = page["image"].width / disp_width
+                real_x, real_y = value["x"] * scale, value["y"] * scale
+                click_threshold = page["space"] * 1.5 
+                
+                found_note = None
+                # カスタムクリックの中から探す
+                for pt in clicks:
+                    if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
+                        found_note = (int(pt[0]), int(pt[1]))
+                        break
+                # 自動検出の中から探す
+                if not found_note:
+                    for box in page["notes"]:
+                        cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
+                        if not any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto):
+                            if math.hypot(real_x - cx, real_y - cy) < click_threshold:
+                                found_note = (cx, cy)
+                                break
+                
+                # 見つからなければ新規追加して選択状態にする
+                if not found_note:
+                    clicks.append((real_x, real_y))
+                    found_note = (int(real_x), int(real_y))
+                
+                # 現在のラベルを取得
+                current_label = custom_labels_page.get(found_note)
+                if current_label is None:
+                    s_idx = np.argmin([abs(np.mean(s) - found_note[1]) for s in page["staves"]])
+                    clef = "treble" if s_idx % 2 == 0 else "bass"
+                    current_label = get_pitch_name(found_note[1], page["staves"][s_idx], clef)
+                
+                st.session_state.selected_note = {"page": i, "x": found_note[0], "y": found_note[1], "label": current_label}
+                st.rerun()
+
+            # 選択中の音符のテキスト編集UI
+            if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
+                sel = st.session_state.selected_note
+                new_label = st.text_input(f"✎ 選択中の音符のテキスト（ページ {i+1}）", value=sel["label"], key=f"input_{i}")
+                if new_label != sel["label"]:
+                    custom_labels_page[(sel["x"], sel["y"])] = new_label
+                    st.session_state.selected_note["label"] = new_label
+                    st.rerun()
+        else:
+            st.image(page["image"], width=disp_width)
+
+# ==========================================
+# STEP 4: プレビュー＆ダウンロード
+# ==========================================
+if st.session_state.step == 4:
+    st.subheader("Step 4: 完成プレビュー＆ダウンロード")
+    col1, col2 = st.columns([1, 1])
+    col1.info("✅ 枠線が消え、テキストのみが描画された完成版です。")
+    col2.button("⬅️ 戻る (Step 3へ)", on_click=prev_step)
+    
+    out_images = []
+    for i, page in enumerate(pages):
+        st.write(f"### ページ {i + 1}")
+        if page["staves"]:
+            res_img = draw_all_notes(
+                page["image"], 
+                page["notes"], 
+                st.session_state.custom_clicks.get(i, []), 
+                st.session_state.deleted_auto_notes.get(i, []), 
+                page["staves"], 
+                page["space"], 
+                st.session_state.custom_labels.get(i, {}),
+                hide_boxes=True # 枠線を非表示にするフラグ
+            )
+            out_images.append(res_img)
+            st.image(res_img, width=disp_width)
+        else:
+            out_images.append(page["image"])
+            st.image(page["image"], width=disp_width)
+            
+    # ダウンロードボタンの生成
+    if out_images:
+        pdf_buffer = io.BytesIO()
+        out_images[0].save(pdf_buffer, format="PDF", save_all=True, append_images=out_images[1:])
+        st.download_button(
+            label="📥 楽譜をPDFでダウンロード",
+            data=pdf_buffer.getvalue(),
+            file_name="score_with_notes.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True
+        )
