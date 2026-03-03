@@ -119,7 +119,7 @@ def get_pitch_name(note_y, staff, clef, flats_count):
     return name, name in flat_order[:flats_count]
 
 # ==========================================
-# 2. 描画処理（削除リストの引数を追加）
+# 2. 描画・キャッシュ処理
 # ==========================================
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, flats_count):
     result = pil_img.copy().convert("RGB")
@@ -158,10 +158,21 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         draw_label(cx, yc, True)
     return result
 
+@st.cache_data(show_spinner=False)
+def process_pdf_and_detect(pdf_bytes, internal_threshold):
+    """PDF変換と自動検出をキャッシュする関数（必須）"""
+    imgs = convert_from_bytes(pdf_bytes)
+    data = []
+    for img in imgs:
+        staves, space = detect_staff_groups_v8(img)
+        notes = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else []
+        data.append({"image": img, "staves": staves, "space": space, "notes": notes})
+    return data
+
 # ==========================================
 # 3. Streamlit UI
 # ==========================================
-st.set_page_config(page_title="ドレミ付与 V8", layout="wide") # 画面を広く使う
+st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 st.title("🎼 ドレミ付与ツール V8")
 st.info("💡 **操作方法:** 検出漏れの場所をクリックすると追加されます。すでにある音符（枠線）の近くをクリックすると削除されます。")
 
@@ -175,10 +186,11 @@ st.sidebar.header("⚙️ 設定")
 flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4)
 ui_sens = st.sidebar.slider("検出感度", 1, 100, 50)
 internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
-disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800) # 前回の画面サイズ調整
+disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800)
 
 up = st.file_uploader("PDFをアップロード", type="pdf")
 if up:
+    # 欠けていた process_pdf_and_detect 関数を呼び出します
     pages = process_pdf_and_detect(up.read(), internal_threshold)
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
@@ -194,7 +206,6 @@ if up:
                 clicked_x, clicked_y = value["x"], value["y"]
                 
                 # スケール調整（表示サイズと元画像の比率を計算）
-                # widthが指定されている場合、返ってくる座標は表示サイズ基準になることがあるため、元画像スケールに戻す
                 scale = page["image"].width / disp_width
                 real_x, real_y = clicked_x * scale, clicked_y * scale
                 
@@ -213,7 +224,6 @@ if up:
                 if not action_taken:
                     for box in page["notes"]:
                         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                        # 削除済みでないかチェックしつつ距離計算
                         is_already_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
                         if not is_already_deleted and math.hypot(real_x - cx, real_y - cy) < click_threshold:
                             if i not in st.session_state.deleted_auto_notes:
@@ -232,7 +242,7 @@ if up:
         else:
             st.image(page["image"], width=disp_width)
 
-    # リセットボタン（追加も削除もすべて初期化）
+    # リセットボタン
     if st.button("手動編集をすべてリセット"):
         st.session_state.custom_clicks = {}
         st.session_state.deleted_auto_notes = {}
