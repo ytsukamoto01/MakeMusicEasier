@@ -76,9 +76,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    # 画像内の「黒い塊」ごとの大きさを計測
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
-
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
@@ -87,6 +84,11 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
 
     staff_centers = [np.mean(s) for s in staves]
     raw_rects, raw_scores = [], []
+    
+    chk_w = int(staff_space * 2.5)
+    chk_h = int(staff_space * 3.5)
+    img_h, img_w = filled.shape
+
     for (x, y) in zip(*loc[::-1]):
         w, h = nw, nh
         score = res[y, x]
@@ -94,53 +96,62 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        # 連桁（ビーム）や縦棒の排除ロジック（強化）
-        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
-        label = labels[cy, cx]
-        if label == 0: continue # 背景
+        chk_x1 = max(0, cx - chk_w // 2)
+        chk_x2 = min(img_w, cx + chk_w // 2)
+        chk_y1 = max(0, cy - chk_h // 2)
+        chk_y2 = min(img_h, cy + chk_h // 2)
         
-        comp_w = stats[label, cv2.CC_STAT_WIDTH]
-        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
-        comp_area = stats[label, cv2.CC_STAT_AREA]   # ← 追加：成分の面積
+        patch_check = filled[chk_y1:chk_y2, chk_x1:chk_x2]
+        contours, _ = cv2.findContours(patch_check, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: continue
         
-        # 塊の幅が「音符3.5個分」より広い場合は連桁（ビーム）やタイとみなして除外
-        if comp_w > staff_space * 3.5: continue
-        # 塊の高さが異常に高い場合は縦の反復記号や音部記号とみなして除外
-        if comp_h > staff_space * 5.5: continue
-        # 【新規】成分の面積が大きすぎる場合（音符3個分以上）は除外（連桁・反復記号対策）
-        if comp_area > staff_space ** 2 * 3.0: continue
-
-        patch = filled[y:y+h, x:x+w]
-        contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cnt = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(cnt)
+        pcx = cx - chk_x1
+        pcy = cy - chk_y1
+        
+        best_cnt = None
+        min_dist = float('inf')
+        for c_ in contours:
+            M = cv2.moments(c_)
+            if M["m00"] == 0: continue
+            mx = int(M["m10"] / M["m00"])
+            my = int(M["m01"] / M["m00"])
+            dist = math.hypot(mx - pcx, my - pcy)
+            if dist < min_dist:
+                min_dist = dist
+                best_cnt = c_
+                
+        if best_cnt is None or min_dist > staff_space * 0.8: continue
+        
+        ph, pw = patch_check.shape
+        bx, by, bw, bh = cv2.boundingRect(best_cnt)
+        touch_margin = 1
+        if bx <= touch_margin or by <= touch_margin or (bx + bw) >= pw - touch_margin or (by + bh) >= ph - touch_margin:
+            continue
             
-            if area < (staff_space**2) * 0.3: continue
-            
-            rect = cv2.minAreaRect(cnt)
-            (rw, rh) = rect[1]
-            if rw == 0 or rh == 0: continue
-            
-            # アスペクト比の閾値を 2.2 → 2.0 に厳格化
-            rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.0: continue 
-            
-            rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.85: continue 
-            
-            peri = cv2.arcLength(cnt, True)
-            if peri > 0:
-                # 円形度の閾値を 0.60 → 0.65 に引き上げ
-                circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.65: 
-                    hull = cv2.convexHull(cnt)
-                    hull_area = cv2.contourArea(hull)
-                    if hull_area > 0:
-                        solidity = area / float(hull_area)
-                        if solidity >= 0.85:
-                            raw_rects.append([x, y, x+w, y+h])
-                            raw_scores.append(score)
+        area = cv2.contourArea(best_cnt)
+        if area < (staff_space**2) * 0.3: continue
+        
+        rect = cv2.minAreaRect(best_cnt)
+        (rw, rh) = rect[1]
+        if rw == 0 or rh == 0: continue
+        
+        rotated_aspect = max(rw, rh) / min(rw, rh)
+        if rotated_aspect > 2.2: continue 
+        
+        rotated_extent = area / (rw * rh)
+        if rotated_extent > 0.88: continue 
+        
+        peri = cv2.arcLength(best_cnt, True)
+        if peri > 0:
+            circularity = 4.0 * np.pi * area / (peri**2)
+            if circularity >= 0.55: 
+                hull = cv2.convexHull(best_cnt)
+                hull_area = cv2.contourArea(hull)
+                if hull_area > 0:
+                    solidity = area / float(hull_area)
+                    if solidity >= 0.85:
+                        raw_rects.append([cx - w//2, cy - h//2, cx + w//2, cy + h//2])
+                        raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
@@ -313,7 +324,6 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -330,10 +340,11 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
+# 🛑【修正箇所】感度を 100 固定にする（0.85 - (100 / 100.0) * 0.40 = 0.45）
+CONSTANT_THRESHOLD = 0.45
 
 if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
+    pages = process_pdf_and_detect(st.session_state.pdf_data, CONSTANT_THRESHOLD)
 else:
     pages = []
 
@@ -351,17 +362,17 @@ if st.session_state.step == 2:
     subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
     subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
 
-    img_container_col, slider_container_col = st.columns([4, 1]) 
+    # 🛑【修正箇所】スライダーをなくして操作ガイドのみ表示
+    img_container_col, guide_container_col = st.columns([4, 1]) 
 
-    with slider_container_col:
+    with guide_container_col:
         st.write("### ") 
-        st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
+        st.subheader("🖱️ 操作ガイド")
+        st.info("💡 現在、検出感度は最高（100）に設定されています。")
         st.divider()
-        st.subheader("🖱️ 操作モード")
-        edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
+        edit_mode = st.radio("クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
-            st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
+            st.warning("⚠️ **範囲消去モード**\nエリアの「左上」と「右下」をクリック。")
 
     with img_container_col:
         for i, page in enumerate(pages):
@@ -371,11 +382,8 @@ if st.session_state.step == 2:
                 deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
                 
                 erase_start_key = f"s2_erase_start_{i}"
-                if erase_start_key not in st.session_state: 
-                    st.session_state[erase_start_key] = None
-                
-                if "範囲消去" not in edit_mode:
-                    st.session_state[erase_start_key] = None
+                if erase_start_key not in st.session_state: st.session_state[erase_start_key] = None
+                if "範囲消去" not in edit_mode: st.session_state[erase_start_key] = None
 
                 res_img = draw_all_notes(
                     page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
@@ -383,16 +391,13 @@ if st.session_state.step == 2:
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
-                
                 last_click_key = f"s2_last_click_{i}"
                 if last_click_key not in st.session_state: st.session_state[last_click_key] = None
                 
                 if value and value != st.session_state[last_click_key]:
                     st.session_state[last_click_key] = value 
-                    
-                    clicked_x, clicked_y = value["x"], value["y"]
                     scale = page["image"].width / FIXED_DISP_WIDTH
-                    real_x, real_y = clicked_x * scale, clicked_y * scale
+                    real_x, real_y = value["x"] * scale, value["y"] * scale
                     
                     if "範囲消去" in edit_mode:
                         if st.session_state[erase_start_key] is None:
@@ -409,122 +414,75 @@ if st.session_state.step == 2:
                                         deleted_auto.append((cx, cy))
                             st.session_state[erase_start_key] = None
                     else:
-                        hit_threshold_x = page["space"] * 0.8
-                        hit_threshold_y = page["space"] * 0.45 
+                        hit_threshold_x, hit_threshold_y = page["space"] * 0.8, page["space"] * 0.45 
                         action_taken = False
-
                         for pt in clicks.copy():
                             if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y:
-                                clicks.remove(pt)
-                                action_taken = True
-                                break
-
+                                clicks.remove(pt); action_taken = True; break
                         if not action_taken:
                             for box in page["notes"]:
                                 cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
                                 if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
                                     if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y:
-                                        deleted_auto.append((cx, cy))
-                                        action_taken = True
-                                        break
-
-                        if not action_taken:
-                            clicks.append((real_x, real_y))
+                                        deleted_auto.append((cx, cy)); action_taken = True; break
+                        if not action_taken: clicks.append((real_x, real_y))
                     st.rerun() 
             else:
-                st.warning(f"⚠️ ページ {i+1} からは五線が検出されませんでした。")
-                st.image(page["image"], width=FIXED_DISP_WIDTH)
+                st.warning(f"⚠️ ページ {i+1} 五線検出不能"); st.image(page["image"], width=FIXED_DISP_WIDTH)
 
 if st.session_state.step == 3:
     col1, col2 = st.columns([1, 1])
     col1.subheader("Step 3: マニュアル微調整")
-    col1.info("💡 **操作:** 音符をクリックして選択し、下の入力欄で「ドレミ」を自由に変更できます。")
     col2.button("次へ：完成プレビュー ➡️", on_click=next_step, type="primary")
     col2.button("⬅️ 戻る (Step 2へ)", on_click=prev_step)
 
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
-            clicks = st.session_state.custom_clicks.get(i, [])
-            deleted_auto = st.session_state.deleted_auto_notes.get(i, [])
+            clicks, deleted_auto = st.session_state.custom_clicks.get(i, []), st.session_state.deleted_auto_notes.get(i, [])
             custom_labels_page = st.session_state.custom_labels.setdefault(i, {})
-            
-            sel_pos = None
-            if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
-                sel_pos = (st.session_state.selected_note["x"], st.session_state.selected_note["y"])
-
+            sel_pos = (st.session_state.selected_note["x"], st.session_state.selected_note["y"]) if st.session_state.selected_note and st.session_state.selected_note["page"] == i else None
             res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], custom_labels_page, selected_pos=sel_pos)
             value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
-            
             last_click_key = f"s3_last_click_{i}"
             if last_click_key not in st.session_state: st.session_state[last_click_key] = None
-            
             if value and value != st.session_state[last_click_key]:
                 st.session_state[last_click_key] = value
                 scale = page["image"].width / FIXED_DISP_WIDTH
                 real_x, real_y = value["x"] * scale, value["y"] * scale
-                
-                hit_threshold_x = page["space"] * 0.8
-                hit_threshold_y = page["space"] * 0.45 
-                
+                hit_threshold_x, hit_threshold_y = page["space"] * 0.8, page["space"] * 0.45 
                 found_note = None
                 for pt in clicks:
-                    if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y:
-                        found_note = (int(pt[0]), int(pt[1]))
-                        break
+                    if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y: found_note = (int(pt[0]), int(pt[1])); break
                 if not found_note:
                     for box in page["notes"]:
                         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
                         if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
-                            if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y:
-                                found_note = (cx, cy)
-                                break
-                
-                if not found_note:
-                    clicks.append((real_x, real_y))
-                    found_note = (int(real_x), int(real_y))
-                
+                            if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y: found_note = (cx, cy); break
+                if not found_note: clicks.append((real_x, real_y)); found_note = (int(real_x), int(real_y))
                 current_label = custom_labels_page.get(found_note)
                 if current_label is None:
                     s_idx = np.argmin([abs(np.mean(s) - found_note[1]) for s in page["staves"]])
-                    clef = "treble" if s_idx % 2 == 0 else "bass"
-                    current_label = get_pitch_name(found_note[1], page["staves"][s_idx], clef)
-                
-                st.session_state.selected_note = {"page": i, "x": found_note[0], "y": found_note[1], "label": current_label}
-                st.rerun()
-
+                    current_label = get_pitch_name(found_note[1], page["staves"][s_idx], "treble" if s_idx % 2 == 0 else "bass")
+                st.session_state.selected_note = {"page": i, "x": found_note[0], "y": found_note[1], "label": current_label}; st.rerun()
             if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
                 sel = st.session_state.selected_note
-                new_label = st.text_input(f"✎ 選択中の音符のテキスト（ページ {i+1}）", value=sel["label"], key=f"input_{i}")
-                if new_label != sel["label"]:
-                    custom_labels_page[(sel["x"], sel["y"])] = new_label
-                    st.session_state.selected_note["label"] = new_label
-                    st.rerun()
-        else:
-            st.image(page["image"], width=FIXED_DISP_WIDTH)
+                new_label = st.text_input(f"✎ ページ {i+1} テキスト変更", value=sel["label"], key=f"input_{i}")
+                if new_label != sel["label"]: custom_labels_page[(sel["x"], sel["y"])] = new_label; st.session_state.selected_note["label"] = new_label; st.rerun()
+        else: st.image(page["image"], width=FIXED_DISP_WIDTH)
 
 if st.session_state.step == 4:
-    st.subheader("Step 4: 完成プレビュー＆ダウンロード")
+    st.subheader("Step 4: 完成プレビュー")
     col1, col2 = st.columns([1, 1])
-    col1.info("✅ 枠線が消え、テキストのみが描画された完成版です。")
     col2.button("⬅️ 戻る (Step 3へ)", on_click=prev_step)
-    
     out_images = []
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
-            res_img = draw_all_notes(
-                page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), 
-                st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], 
-                st.session_state.custom_labels.get(i, {}), hide_boxes=True
-            )
-            out_images.append(res_img)
-            st.image(res_img, width=FIXED_DISP_WIDTH)
-        else:
-            out_images.append(page["image"])
-            st.image(page["image"], width=FIXED_DISP_WIDTH)
-            
+            res_img = draw_all_notes(page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], st.session_state.custom_labels.get(i, {}), hide_boxes=True)
+            out_images.append(res_img); st.image(res_img, width=FIXED_DISP_WIDTH)
+        else: out_images.append(page["image"]); st.image(page["image"], width=FIXED_DISP_WIDTH)
     if out_images:
         pdf_buffer = io.BytesIO()
         out_images[0].save(pdf_buffer, format="PDF", save_all=True, append_images=out_images[1:])
-        st.download_button("📥 楽譜をPDFでダウンロード", data=pdf_buffer.getvalue(), file_name="score_with_notes.pdf", mime="application/pdf", type="primary", use_container_width=True)
+        st.download_button("📥 楽譜PDFをダウンロード", data=pdf_buffer.getvalue(), file_name="score_with_notes.pdf", mime="application/pdf", type="primary", use_container_width=True)
