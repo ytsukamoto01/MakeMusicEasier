@@ -152,7 +152,7 @@ def get_pitch_name(note_y, staff, clef):
     return mapping.get(steps, "")
 
 # ==========================================
-# 2. 描画処理 (和音のグループ化機能を追加)
+# 2. 描画処理 (和音のグループ化機能を追加・修正版)
 # ==========================================
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None):
     result = pil_img.copy().convert("RGB")
@@ -166,18 +166,22 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
 
     drawn_text_rects = []
 
-    # 全ての有効な音符をリストアップ
+    # 全ての有効な音符をリストアップし、どの五線（s_idx）に属しているかを判定
     active_notes = []
     for box in auto_notes:
         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
         if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
-            active_notes.append({"x": cx, "y": cy, "is_custom": False})
+            s_idx = np.argmin([abs(np.mean(s) - cy) for s in staves])
+            active_notes.append({"x": cx, "y": cy, "s_idx": s_idx, "is_custom": False})
             
     for cx, cy in custom_clicks:
-        active_notes.append({"x": int(cx), "y": int(cy), "is_custom": True})
+        s_idx = np.argmin([abs(np.mean(s) - cy) for s in staves])
+        active_notes.append({"x": int(cx), "y": int(cy), "s_idx": s_idx, "is_custom": True})
 
-    # X座標が近いものを「和音」としてグループ化
-    active_notes.sort(key=lambda n: n["x"])
+    # 🛑【修正箇所】五線(s_idx) ごとにソートしてから、X座標でソート
+    # これにより、右手と左手が混ざることを防ぎます
+    active_notes.sort(key=lambda n: (n["s_idx"], n["x"]))
+    
     groups = []
     for note in active_notes:
         if not groups:
@@ -185,7 +189,8 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         else:
             last_group = groups[-1]
             avg_x = sum(n["x"] for n in last_group) / len(last_group)
-            if abs(note["x"] - avg_x) < space * 0.8: # X座標が近いものは同じ和音
+            # 🛑【修正箇所】X座標が近く、かつ「同じ五線」の場合のみ結合する
+            if abs(note["x"] - avg_x) < space * 0.8 and note["s_idx"] == last_group[0]["s_idx"]:
                 last_group.append(note)
             else:
                 groups.append([note])
@@ -196,8 +201,7 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         labels_to_draw = []
         
         for note in group:
-            x, y, is_custom = note["x"], note["y"], note["is_custom"]
-            s_idx = np.argmin([abs(np.mean(s) - y) for s in staves])
+            x, y, s_idx, is_custom = note["x"], note["y"], note["s_idx"], note["is_custom"]
             clef = "treble" if s_idx % 2 == 0 else "bass"
             
             p_name = None
@@ -375,7 +379,6 @@ if st.session_state.step == 2:
                                         deleted_auto.append((cx, cy))
                             st.session_state[erase_start_key] = None
                     else:
-                        # ★和音対応：Y軸の当たり判定を厳しくして隣の音符を消さないように！
                         hit_threshold_x = page["space"] * 0.8
                         hit_threshold_y = page["space"] * 0.45 
                         action_taken = False
@@ -431,7 +434,6 @@ if st.session_state.step == 3:
                 scale = page["image"].width / FIXED_DISP_WIDTH
                 real_x, real_y = value["x"] * scale, value["y"] * scale
                 
-                # ★和音対応：Y軸の当たり判定を厳しく
                 hit_threshold_x = page["space"] * 0.8
                 hit_threshold_y = page["space"] * 0.45 
                 
