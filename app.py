@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (V8 ロジック + 線分マスク)
+# 1. 楽譜解析エンジン (V8 ロジック + 線分マスク修正版)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -69,29 +69,31 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # ===== [NEW] 線分検出によるマスク作成 =====
-    # LSD (Line Segment Detector) を初期化
-    lsd = cv2.createLineSegmentDetector(0)
-    lines, width, prec, nfa = lsd.detect(gray_img)
+    # ===== [MODIFIED] モルフォロジー演算による太い線分のマスク作成 =====
+    # 反復記号のような「太い縦線」を検出
+    # 幅が staff_space*0.3 以上、高さが staff_space*3 以上のブロックを抽出
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, int(staff_space * 0.3)), int(staff_space * 3)))
+    thick_v = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
     
-    # マスク画像（白地に黒い線分領域）を作成
-    line_mask = np.ones_like(gray_img) * 255  # 初期は全白
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            # 線分の長さが staff_space の 2.5 倍以上あるものを「大きな線」とみなす
-            length = np.hypot(x2 - x1, y2 - y1)
-            if length > staff_space * 2.5:
-                # 線分を太らせてマスクに描画（太さは staff_space の 0.4 倍）
-                thickness = max(2, int(staff_space * 0.4))
-                cv2.line(line_mask, (int(x1), int(y1)), (int(x2), int(y2)), 0, thickness)
-    # マスクを二値化（線分領域 = 0, それ以外 = 255）
-    _, line_mask = cv2.threshold(line_mask, 127, 255, cv2.THRESH_BINARY)
-    # ========================================
+    # 連桁のような「太い横線」を検出
+    # 幅が staff_space*2.5 以上、高さが staff_space*0.3 以上のブロックを抽出
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(staff_space * 2.5), max(2, int(staff_space * 0.3))))
+    thick_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
+    
+    # 縦線と横線を合成し、少し膨張させて完全に削り取る準備をする
+    thick_lines = cv2.bitwise_or(thick_v, thick_h)
+    thick_lines = cv2.dilate(thick_lines, np.ones((3,3), np.uint8), iterations=1)
+    
+    # 元の二値化画像から太い線（連桁・反復記号）を完全に除去
+    thresh_clean = cv2.subtract(thresh, thick_lines)
+    # ==================================================
 
+    # 符頭だけを残すためのカーネルサイズを少し拡大（0.6 -> 0.8）
+    # これにより、斜めの連桁の破片なども確実に消し去ります
     open_k_size = max(3, int(staff_space * 0.8))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
-    notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
+    notes_only = cv2.morphologyEx(thresh_clean, cv2.MORPH_OPEN, open_k)
+    
     close_k_size = max(3, int(staff_space * 0.3))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
@@ -111,13 +113,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         w, h = nw, nh
         score = res[y, x]
         cx, cy = x + w//2, y + h//2
-        
-        # ===== [NEW] 線分マスク上でこの点が有効かチェック =====
-        if cy >= line_mask.shape[0] or cx >= line_mask.shape[1]:
-            continue
-        if line_mask[cy, cx] == 0:   # 線分領域内なら除外
-            continue
-        # ==================================================
         
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
@@ -353,6 +348,9 @@ st.divider()
 
 FIXED_DISP_WIDTH = 800 
 internal_threshold = 0.85 - (100 / 100.0) * 0.40
+
+st.write(st.session_state.ui_sens)
+st.write(internal_threshold)
 
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
