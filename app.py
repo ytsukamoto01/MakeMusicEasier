@@ -352,8 +352,9 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.45
+internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
+st.write(st.session_state.ui_sens)
 st.write(internal_threshold)
 
 if st.session_state.pdf_data:
