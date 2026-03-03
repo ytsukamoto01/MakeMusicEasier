@@ -89,7 +89,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     _, line_mask = cv2.threshold(line_mask, 127, 255, cv2.THRESH_BINARY)
     # ========================================
 
-    open_k_size = max(3, int(staff_space * 0.6))
+    open_k_size = max(3, int(staff_space * 0.8))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
     close_k_size = max(3, int(staff_space * 0.3))
@@ -353,9 +353,6 @@ st.divider()
 
 FIXED_DISP_WIDTH = 800 
 internal_threshold = 0.85 - (100 / 100.0) * 0.40
-
-st.write(st.session_state.ui_sens)
-st.write(internal_threshold)
 
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
