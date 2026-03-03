@@ -152,9 +152,8 @@ def get_pitch_name(note_y, staff, clef):
     return mapping.get(steps, "")
 
 # ==========================================
-# 2. 描画・キャッシュ処理 
+# 2. 描画処理 (和音のグループ化機能を追加)
 # ==========================================
-# ★【追加】erase_start 引数を追加し、範囲消去の始点を視覚化
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
@@ -167,57 +166,89 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
 
     drawn_text_rects = []
 
-    def draw_label(x, yc, is_custom=False):
-        s_idx = np.argmin([abs(np.mean(s) - yc) for s in staves])
-        clef = "treble" if s_idx % 2 == 0 else "bass"
-        p_name = get_pitch_name(yc, staves[s_idx], clef)
-        
-        lbl_key = (int(x), int(yc))
-        if lbl_key in custom_labels:
-            p_name = custom_labels[lbl_key]
-        
-        if p_name or not hide_boxes:
-            hw, hh = int(space * 0.6), int(space * 0.5)
-            b = [x - hw, yc - hh, x + hw, yc + hh]
+    # 全ての有効な音符をリストアップ
+    active_notes = []
+    for box in auto_notes:
+        cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
+        if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
+            active_notes.append({"x": cx, "y": cy, "is_custom": False})
             
+    for cx, cy in custom_clicks:
+        active_notes.append({"x": int(cx), "y": int(cy), "is_custom": True})
+
+    # X座標が近いものを「和音」としてグループ化
+    active_notes.sort(key=lambda n: n["x"])
+    groups = []
+    for note in active_notes:
+        if not groups:
+            groups.append([note])
+        else:
+            last_group = groups[-1]
+            avg_x = sum(n["x"] for n in last_group) / len(last_group)
+            if abs(note["x"] - avg_x) < space * 0.8: # X座標が近いものは同じ和音
+                last_group.append(note)
+            else:
+                groups.append([note])
+
+    # グループごとに描画
+    for group in groups:
+        group.sort(key=lambda n: n["y"]) # Y座標（高い音順）でソート
+        labels_to_draw = []
+        
+        for note in group:
+            x, y, is_custom = note["x"], note["y"], note["is_custom"]
+            s_idx = np.argmin([abs(np.mean(s) - y) for s in staves])
+            clef = "treble" if s_idx % 2 == 0 else "bass"
+            
+            p_name = None
+            for (lx, ly), label in custom_labels.items():
+                if math.hypot(x - lx, y - ly) < 2.0:
+                    p_name = label
+                    break
+            if p_name is None:
+                p_name = get_pitch_name(y, staves[s_idx], clef)
+                
+            if p_name:
+                labels_to_draw.append(p_name)
+                
+            # 枠線の描画
             if not hide_boxes:
                 box_color = (255, 165, 0) if is_custom else (0, 255, 0)
-                if selected_pos and math.hypot(x - selected_pos[0], yc - selected_pos[1]) < 2:
+                hw, hh = int(space * 0.6), int(space * 0.5)
+                b = [x - hw, y - hh, x + hw, y + hh]
+                
+                if selected_pos and math.hypot(x - selected_pos[0], y - selected_pos[1]) < 2:
                     draw.rectangle(b, outline=(0, 0, 255), width=4)
                 else:
                     draw.rectangle(b, outline=box_color, width=2)
+
+        # テキストの描画（和音の場合は「ソ ミ ド」のように一行にまとめて表示）
+        if labels_to_draw and (not hide_boxes or any(l for l in labels_to_draw)):
+            min_y = group[0]["y"]
+            group_avg_x = sum(n["x"] for n in group) / len(group)
             
-            if p_name:
-                color = (255, 0, 0)
-                text_x = b[0]
-                text_y = b[1] - int(space * 1.6)
-                text_w = len(p_name) * font_size
-                text_h = font_size
-                
-                while True:
-                    is_overlapping = False
-                    for (rx, ry, rw, rh) in drawn_text_rects:
-                        if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
-                            is_overlapping = True
-                            break
-                    if is_overlapping:
-                        text_x += int(font_size * 1.1)
-                    else:
+            combined_text = " ".join(labels_to_draw)
+            
+            text_x = group_avg_x - int(space * 0.6)
+            text_y = min_y - int(space * 1.6)
+            text_w = len(combined_text) * font_size
+            text_h = font_size
+            
+            while True:
+                is_overlapping = False
+                for (rx, ry, rw, rh) in drawn_text_rects:
+                    if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
+                        is_overlapping = True
                         break
+                if is_overlapping:
+                    text_x += int(font_size * 1.1)
+                else:
+                    break
+                    
+            draw.text((text_x, text_y), combined_text, font=font, fill=(255, 0, 0))
+            drawn_text_rects.append((text_x, text_y, text_w, text_h))
 
-                draw.text((text_x, text_y), p_name, font=font, fill=color)
-                drawn_text_rects.append((text_x, text_y, text_w, text_h))
-
-    for box in auto_notes:
-        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-        is_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
-        if not is_deleted:
-            draw_label(cx, cy, False)
-
-    for (cx, yc) in custom_clicks:
-        draw_label(cx, yc, True)
-        
-    # ★【追加】範囲消去モードの1点目がクリックされている場合、十字線を描画
+    # 範囲消去の十字線
     if erase_start and not hide_boxes:
         ex, ey = erase_start
         r = max(4, int(space * 0.4))
@@ -238,7 +269,7 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
     return data
 
 # ==========================================
-# 3. Streamlit UI (ウィザード形式)
+# 3. Streamlit UI
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 
@@ -272,21 +303,14 @@ if st.session_state.pdf_data:
 else:
     pages = []
 
-# ==========================================
-# STEP 1: アップロード
-# ==========================================
 if st.session_state.step == 1:
     st.subheader("Step 1: 楽譜PDFをアップロード")
     up = st.file_uploader("PDFファイルを選択してください", type="pdf")
-    
     if up:
         st.session_state.pdf_data = up.getvalue()
         st.success("PDFを読み込みました！次へ進んでください。")
         st.button("次へ ➡️", on_click=next_step, type="primary")
 
-# ==========================================
-# STEP 2: ワンクリック自動調整
-# ==========================================
 if st.session_state.step == 2:
     subheader_col1, subheader_col2 = st.columns([2, 1])
     subheader_col1.subheader("Step 2: 自動検出の調整")
@@ -295,27 +319,16 @@ if st.session_state.step == 2:
 
     img_container_col, slider_container_col = st.columns([4, 1]) 
 
-    # --- 右カラム：固定設定エリア ---
     with slider_container_col:
         st.write("### ") 
         st.subheader("⚙️ 調整設定")
-        st.slider(
-            "🔍 検出感度", 
-            1, 100, 
-            key="ui_sens",
-            help="大きくするとより多くの音符が検出されますが、ノイズも増えます。"
-        )
+        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
         st.divider()
         st.subheader("🖱️ 操作モード")
-        # ★【追加】操作モードの切り替えトグル
-        edit_mode = st.radio(
-            "画像クリック時の動作", 
-            ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"],
-        )
+        edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
             st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
 
-    # --- 左カラム：画像表示エリア ---
     with img_container_col:
         for i, page in enumerate(pages):
             st.write(f"### ページ {i + 1}")
@@ -323,24 +336,16 @@ if st.session_state.step == 2:
                 clicks = st.session_state.custom_clicks.setdefault(i, [])
                 deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
                 
-                # ★【追加】範囲消去の始点を保持するステート
                 erase_start_key = f"s2_erase_start_{i}"
                 if erase_start_key not in st.session_state: 
                     st.session_state[erase_start_key] = None
                 
-                # モードが切り替わったら始点をリセット
                 if "範囲消去" not in edit_mode:
                     st.session_state[erase_start_key] = None
 
                 res_img = draw_all_notes(
-                    page["image"], 
-                    page["notes"], 
-                    clicks, 
-                    deleted_auto, 
-                    page["staves"], 
-                    page["space"], 
-                    st.session_state.custom_labels.get(i, {}),
-                    erase_start=st.session_state[erase_start_key] # 始点を渡して十字線を描画
+                    page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
+                    st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key]
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
@@ -355,37 +360,28 @@ if st.session_state.step == 2:
                     scale = page["image"].width / FIXED_DISP_WIDTH
                     real_x, real_y = clicked_x * scale, clicked_y * scale
                     
-                    # 🛑【追加】範囲消去モードのロジック
                     if "範囲消去" in edit_mode:
                         if st.session_state[erase_start_key] is None:
-                            # 1回目のクリック（始点記録）
                             st.session_state[erase_start_key] = (real_x, real_y)
                         else:
-                            # 2回目のクリック（終点記録＆一括削除実行）
                             x1, y1 = st.session_state[erase_start_key]
                             x2, y2 = real_x, real_y
-                            min_x, max_x = min(x1, x2), max(x1, x2)
-                            min_y, max_y = min(y1, y2), max(y1, y2)
-
-                            # 手動追加分の削除
+                            min_x, max_x, min_y, max_y = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
                             clicks[:] = [pt for pt in clicks if not (min_x <= pt[0] <= max_x and min_y <= pt[1] <= max_y)]
-
-                            # 自動検出分の削除
                             for box in page["notes"]:
                                 cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
                                 if min_x <= cx <= max_x and min_y <= cy <= max_y:
-                                    if not any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto):
+                                    if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
                                         deleted_auto.append((cx, cy))
-                                        
-                            st.session_state[erase_start_key] = None # 実行後にリセット
-                    
-                    # 従来の通常モードロジック
+                            st.session_state[erase_start_key] = None
                     else:
-                        click_threshold = page["space"] * 1.5 
+                        # ★和音対応：Y軸の当たり判定を厳しくして隣の音符を消さないように！
+                        hit_threshold_x = page["space"] * 0.8
+                        hit_threshold_y = page["space"] * 0.45 
                         action_taken = False
 
                         for pt in clicks.copy():
-                            if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
+                            if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y:
                                 clicks.remove(pt)
                                 action_taken = True
                                 break
@@ -393,23 +389,19 @@ if st.session_state.step == 2:
                         if not action_taken:
                             for box in page["notes"]:
                                 cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                                is_already_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
-                                if not is_already_deleted and math.hypot(real_x - cx, real_y - cy) < click_threshold:
-                                    deleted_auto.append((cx, cy))
-                                    action_taken = True
-                                    break
+                                if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
+                                    if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y:
+                                        deleted_auto.append((cx, cy))
+                                        action_taken = True
+                                        break
 
                         if not action_taken:
                             clicks.append((real_x, real_y))
-                    
                     st.rerun() 
             else:
                 st.warning(f"⚠️ ページ {i+1} からは五線が検出されませんでした。")
                 st.image(page["image"], width=FIXED_DISP_WIDTH)
 
-# ==========================================
-# STEP 3: マニュアル微調整
-# ==========================================
 if st.session_state.step == 3:
     col1, col2 = st.columns([1, 1])
     col1.subheader("Step 3: マニュアル微調整")
@@ -438,18 +430,21 @@ if st.session_state.step == 3:
                 st.session_state[last_click_key] = value
                 scale = page["image"].width / FIXED_DISP_WIDTH
                 real_x, real_y = value["x"] * scale, value["y"] * scale
-                click_threshold = page["space"] * 1.5 
+                
+                # ★和音対応：Y軸の当たり判定を厳しく
+                hit_threshold_x = page["space"] * 0.8
+                hit_threshold_y = page["space"] * 0.45 
                 
                 found_note = None
                 for pt in clicks:
-                    if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
+                    if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y:
                         found_note = (int(pt[0]), int(pt[1]))
                         break
                 if not found_note:
                     for box in page["notes"]:
                         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
-                        if not any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto):
-                            if math.hypot(real_x - cx, real_y - cy) < click_threshold:
+                        if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
+                            if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y:
                                 found_note = (cx, cy)
                                 break
                 
@@ -476,9 +471,6 @@ if st.session_state.step == 3:
         else:
             st.image(page["image"], width=FIXED_DISP_WIDTH)
 
-# ==========================================
-# STEP 4: プレビュー＆ダウンロード
-# ==========================================
 if st.session_state.step == 4:
     st.subheader("Step 4: 完成プレビュー＆ダウンロード")
     col1, col2 = st.columns([1, 1])
@@ -490,14 +482,9 @@ if st.session_state.step == 4:
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
             res_img = draw_all_notes(
-                page["image"], 
-                page["notes"], 
-                st.session_state.custom_clicks.get(i, []), 
-                st.session_state.deleted_auto_notes.get(i, []), 
-                page["staves"], 
-                page["space"], 
-                st.session_state.custom_labels.get(i, {}),
-                hide_boxes=True
+                page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), 
+                st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], 
+                st.session_state.custom_labels.get(i, {}), hide_boxes=True
             )
             out_images.append(res_img)
             st.image(res_img, width=FIXED_DISP_WIDTH)
@@ -508,11 +495,4 @@ if st.session_state.step == 4:
     if out_images:
         pdf_buffer = io.BytesIO()
         out_images[0].save(pdf_buffer, format="PDF", save_all=True, append_images=out_images[1:])
-        st.download_button(
-            label="📥 楽譜をPDFでダウンロード",
-            data=pdf_buffer.getvalue(),
-            file_name="score_with_notes.pdf",
-            mime="application/pdf",
-            type="primary",
-            use_container_width=True
-        )
+        st.download_button("📥 楽譜をPDFでダウンロード", data=pdf_buffer.getvalue(), file_name="score_with_notes.pdf", mime="application/pdf", type="primary", use_container_width=True)
