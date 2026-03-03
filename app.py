@@ -84,14 +84,13 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
 
     thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
     
-    # ★ 太い線を画像から引き算して除外
+    # 太い線を画像から引き算して除外
     thresh_for_notes = cv2.subtract(thresh, thick_lines_mask)
     # =========================================================
     
-    # 符幹を切断し、分離した連桁をサイズで捨てる
+    # 符幹を切断
     sever_k_size = max(2, int(staff_space * 0.35))
     sever_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size))
-    # ★ ここは引き算後の画像 (thresh_for_notes) を使用
     severed = cv2.morphologyEx(thresh_for_notes, cv2.MORPH_OPEN, sever_k)
     
     num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(severed, connectivity=8)
@@ -102,7 +101,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         h = stats_sev[label, cv2.CC_STAT_HEIGHT]
         area = stats_sev[label, cv2.CC_STAT_AREA]
         
-        # [微調整] 音符の幅を大きく超える横長のもの（斜線・横線の連桁）を除外する条件を強化 (3.5 -> 2.5)
         if w > staff_space * 2.5: continue
         if h > staff_space * 5.0: continue
         if area > staff_space**2 * 4.0: continue
@@ -156,27 +154,30 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             (rw, rh) = rect[1]
             if rw == 0 or rh == 0: continue
             
+            # ★【修正ポイント】形状判定の条件を全体的に緩和しました
             rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.0: continue 
+            if rotated_aspect > 2.5: continue 
             
             rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.85: continue 
+            if rotated_extent > 0.95 or rotated_extent < 0.4: continue 
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
                 circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.65: 
+                # 切り離し跡によるギザギザを考慮し、円形度を 0.65 -> 0.45 に緩和
+                if circularity >= 0.45: 
                     hull = cv2.convexHull(cnt)
                     hull_area = cv2.contourArea(hull)
                     if hull_area > 0:
                         solidity = area / float(hull_area)
-                        if solidity >= 0.85:
+                        # 同様に凸包率も 0.85 -> 0.75 に緩和
+                        if solidity >= 0.75:
                             raw_rects.append([x, y, x+w, y+h])
                             raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
-    if len(nms_boxes) == 0: return [], thick_lines_mask # ★マスクも返す
+    if len(nms_boxes) == 0: return [], thick_lines_mask 
 
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
@@ -200,7 +201,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         
         has_stem = False
         if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
-            # ★ 幹チェックは元の画像(thresh)を使用する
             opened_up = cv2.morphologyEx(thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2], cv2.MORPH_OPEN, stem_k)
             if np.sum(opened_up) > 0: has_stem = True
                 
@@ -210,9 +210,8 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
                 
         if has_stem: final_boxes.append(box)
 
-    return np.array(final_boxes) if final_boxes else [], thick_lines_mask # ★マスクも返す
+    return np.array(final_boxes) if final_boxes else [], thick_lines_mask
 
-# ===== [修正箇所] ヘ音記号の音階マッピングを修正 =====
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
     step_size = abs(line1 - line5) / 8.0
@@ -220,26 +219,21 @@ def get_pitch_name(note_y, staff, clef):
     if clef == "treble":
         mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
     else:
-        # 以前は一番下の線が「シ」になっていたため、正しい「ソ」に修正しました
         mapping = {-6:"ラ",-5:"シ",-4:"ド",-3:"レ",-2:"ミ",-1:"ファ",0:"ソ",1:"ラ",2:"シ",3:"ド",4:"レ",5:"ミ",6:"ファ",7:"ソ",8:"ラ",9:"シ",10:"ド",11:"レ",12:"ミ",13:"ファ",14:"ソ",15:"ラ",16:"シ"}
     return mapping.get(steps, "")
 
 # ==========================================
 # 2. 描画・キャッシュ処理 
 # ==========================================
-# ★ beams_mask を受け取れるように引数を追加
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None, beams_mask=None):
     result = pil_img.copy().convert("RGBA")
     
-    # =========================================================
-    # [追加] デバッグ用に検知した太い線をマゼンタでハイライト
-    # =========================================================
     if beams_mask is not None and not hide_boxes:
-        color_layer = Image.new("RGBA", result.size, (255, 0, 255, 128)) # 半透明のマゼンタ
+        color_layer = Image.new("RGBA", result.size, (255, 0, 255, 128)) 
         mask_img = Image.fromarray(beams_mask).convert("L")
         result.paste(color_layer, (0, 0), mask=mask_img)
 
-    result = result.convert("RGB") # 描画用にRGBに戻す
+    result = result.convert("RGB") 
     draw = ImageDraw.Draw(result)
     
     font_size = max(15, int(space))
@@ -425,7 +419,7 @@ if st.session_state.step == 2:
                 res_img = draw_all_notes(
                     page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
                     st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key],
-                    beams_mask=page["beams_mask"] # ★ マスクを渡す
+                    beams_mask=page["beams_mask"]
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
@@ -501,7 +495,7 @@ if st.session_state.step == 3:
 
             res_img = draw_all_notes(
                 page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
-                custom_labels_page, selected_pos=sel_pos, beams_mask=page["beams_mask"] # ★ マスクを渡す
+                custom_labels_page, selected_pos=sel_pos, beams_mask=page["beams_mask"]
             )
             value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
             
@@ -566,7 +560,7 @@ if st.session_state.step == 4:
                 page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), 
                 st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], 
                 st.session_state.custom_labels.get(i, {}), hide_boxes=True,
-                beams_mask=page["beams_mask"] # ★ マスクを渡す
+                beams_mask=page["beams_mask"] 
             )
             out_images.append(res_img)
             st.image(res_img, width=FIXED_DISP_WIDTH)
