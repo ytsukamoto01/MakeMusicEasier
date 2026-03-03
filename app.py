@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (V8 ロジック)
+# 1. 楽譜解析エンジン (V8 ロジック + 線分マスク)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -69,6 +69,26 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
+    # ===== [NEW] 線分検出によるマスク作成 =====
+    # LSD (Line Segment Detector) を初期化
+    lsd = cv2.createLineSegmentDetector(0)
+    lines, width, prec, nfa = lsd.detect(gray_img)
+    
+    # マスク画像（白地に黒い線分領域）を作成
+    line_mask = np.ones_like(gray_img) * 255  # 初期は全白
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            # 線分の長さが staff_space の 2.5 倍以上あるものを「大きな線」とみなす
+            length = np.hypot(x2 - x1, y2 - y1)
+            if length > staff_space * 2.5:
+                # 線分を太らせてマスクに描画（太さは staff_space の 0.4 倍）
+                thickness = max(2, int(staff_space * 0.4))
+                cv2.line(line_mask, (int(x1), int(y1)), (int(x2), int(y2)), 0, thickness)
+    # マスクを二値化（線分領域 = 0, それ以外 = 255）
+    _, line_mask = cv2.threshold(line_mask, 127, 255, cv2.THRESH_BINARY)
+    # ========================================
+
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
@@ -76,37 +96,45 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
+    # 画像内の「黒い塊」ごとの大きさを計測
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
-    
-    # 完全に純粋な感度100（threshold_val = 0.45）でマッチングを実行
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= threshold_val)
 
     staff_centers = [np.mean(s) for s in staves]
     raw_rects, raw_scores = [], []
-    
     for (x, y) in zip(*loc[::-1]):
         w, h = nw, nh
         score = res[y, x]
         cx, cy = x + w//2, y + h//2
+        
+        # ===== [NEW] 線分マスク上でこの点が有効かチェック =====
+        if cy >= line_mask.shape[0] or cx >= line_mask.shape[1]:
+            continue
+        if line_mask[cy, cx] == 0:   # 線分領域内なら除外
+            continue
+        # ==================================================
+        
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        # 候補部分の「小窓（パッチ）」を切り抜く
-        patch = filled[y:y+h, x:x+w]
+        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        label = labels[cy, cx]
+        if label == 0: continue
         
-        # 🛑【最強フィルター】小窓の中の「黒の詰まり具合（Extent）」を計算
-        black_pixels = cv2.countNonZero(patch)
-        patch_area = w * h
-        extent = black_pixels / float(patch_area)
+        comp_w = stats[label, cv2.CC_STAT_WIDTH]
+        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
+        comp_area = stats[label, cv2.CC_STAT_AREA]
         
-        # 音符（丸）は約0.78。0.85以上は四角く詰まりすぎ（＝連桁や太い縦線）とみなして除外
-        if extent > 0.85: continue
-        # スカスカすぎる場合もノイズとして除外
-        if extent < 0.40: continue
+        if comp_w > staff_space * 3.5: continue
+        if comp_h > staff_space * 5.5: continue
+        if comp_area > staff_space ** 2 * 3.0: continue
 
+        patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
@@ -114,19 +142,32 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             
             if area < (staff_space**2) * 0.3: continue
             
-            # 円形度（丸さ）チェック：感度100の検知力を損なわないようマイルドな基準（0.45）に設定
+            rect = cv2.minAreaRect(cnt)
+            (rw, rh) = rect[1]
+            if rw == 0 or rh == 0: continue
+            
+            rotated_aspect = max(rw, rh) / min(rw, rh)
+            if rotated_aspect > 2.0: continue 
+            
+            rotated_extent = area / (rw * rh)
+            if rotated_extent > 0.85: continue 
+            
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
                 circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.45: 
-                    raw_rects.append([x, y, x+w, y+h])
-                    raw_scores.append(score)
+                if circularity >= 0.65: 
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    if hull_area > 0:
+                        solidity = area / float(hull_area)
+                        if solidity >= 0.85:
+                            raw_rects.append([x, y, x+w, y+h])
+                            raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
     if len(nms_boxes) == 0: return []
 
-    # ト音記号・ヘ音記号の誤検知回避（符幹の確認）
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
@@ -294,6 +335,7 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -310,11 +352,10 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-# 🛑【修正箇所】感度はMAX（閾値は最も低い0.45）に完全固定
-CONSTANT_THRESHOLD = 0.45
+internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
 if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, CONSTANT_THRESHOLD)
+    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
 else:
     pages = []
 
@@ -332,13 +373,14 @@ if st.session_state.step == 2:
     subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
     subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
 
-    img_container_col, guide_container_col = st.columns([4, 1]) 
+    img_container_col, slider_container_col = st.columns([4, 1]) 
 
-    with guide_container_col:
+    with slider_container_col:
         st.write("### ") 
-        st.subheader("🖱️ 操作ガイド")
-        st.info("💡 現在、検出感度は最高（100）に自動設定されています。")
+        st.subheader("⚙️ 調整設定")
+        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
         st.divider()
+        st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
             st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
