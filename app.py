@@ -66,126 +66,135 @@ def nms_v8_strict(boxes, scores, staff_space):
     return boxes[pick].astype("int")
 
 def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
-
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
-    _, thresh = cv2.threshold(
-        blurred, 0, 255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 🛑 1. マスクの作成 (ピンク色になる部分：連桁や太い縦線)
+    beam_w = int(staff_space * 1.5)
+    beam_h = max(2, int(staff_space * 0.25)) 
+    beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
+    thick_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, beam_k)
 
-    # ============================
-    # ① 連桁だけを検出
-    # ============================
+    v_beam_w = max(2, int(staff_space * 0.25))
+    v_beam_h = int(staff_space * 2.5)
+    v_beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (v_beam_w, v_beam_h))
+    thick_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_beam_k)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        thresh, connectivity=8
-    )
+    thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
 
-    beam_mask = np.zeros_like(thresh)
+    # 🛑 2. 音符の検知 (1つ目のコードの「非常に正確なロジック」を完全再現)
+    # 減算などを行わず、生の thresh をそのまま使って音符を検出します
+    open_k_size = max(3, int(staff_space * 0.6))
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
+    notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
+    
+    close_k_size = max(3, int(staff_space * 0.3))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
+    filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    for i in range(1, num_labels):
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
 
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        w = stats[i, cv2.CC_STAT_WIDTH]
-        h = stats[i, cv2.CC_STAT_HEIGHT]
-        area = stats[i, cv2.CC_STAT_AREA]
-
-        # 横長成分だけを連桁候補に
-        if (
-            w > staff_space * 2.5 and
-            h < staff_space * 0.9 and
-            area > staff_space * 2.0
-        ):
-            beam_mask[labels == i] = 255
-
-    # ============================
-    # ② 連桁だけ削除（音符は壊さない）
-    # ============================
-
-    thresh_clean = thresh.copy()
-    thresh_clean[beam_mask == 255] = 0
-
-    # ============================
-    # ③ 音符形状抽出
-    # ============================
-
-    open_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (int(staff_space * 0.7), int(staff_space * 0.7))
-    )
-
-    notes_only = cv2.morphologyEx(
-        thresh_clean,
-        cv2.MORPH_OPEN,
-        open_k
-    )
-
-    close_k = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (int(staff_space * 0.3), int(staff_space * 0.3))
-    )
-
-    filled = cv2.morphologyEx(
-        notes_only,
-        cv2.MORPH_CLOSE,
-        close_k
-    )
-
-    # ============================
-    # ④ テンプレートマッチング
-    # ============================
-
-    nw = int(staff_space * 1.3)
-    nh = int(staff_space * 1.0)
-
+    nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
-    cv2.ellipse(
-        template,
-        (nw // 2, nh // 2),
-        (nw // 2 - 1, nh // 2 - 1),
-        -20, 0, 360,
-        255, -1
-    )
-
-    res = cv2.matchTemplate(
-        filled,
-        template,
-        cv2.TM_CCOEFF_NORMED
-    )
-
+    cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
+    res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= threshold_val)
 
-    raw_boxes = []
-    raw_scores = []
-
     staff_centers = [np.mean(s) for s in staves]
-
+    raw_rects, raw_scores = [], []
     for (x, y) in zip(*loc[::-1]):
-
         w, h = nw, nh
         score = res[y, x]
+        cx, cy = x + w//2, y + h//2
+        dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
+        
+        # ⚠️元の「4.0」に戻しました！これで高音の音符も拾えるようになります
+        if dist_to_nearest_staff > staff_space * 4.0: continue
+        
+        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        label = labels[cy, cx]
+        if label == 0: continue
+        
+        comp_w = stats[label, cv2.CC_STAT_WIDTH]
+        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
+        
+        if comp_w > staff_space * 3.5: continue
+        if comp_h > staff_space * 5.5: continue
 
-        cx = x + w // 2
-        cy = y + h // 2
+        patch = filled[y:y+h, x:x+w]
+        contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(cnt)
+            
+            if area < (staff_space**2) * 0.3: continue
+            
+            rect = cv2.minAreaRect(cnt)
+            (rw, rh) = rect[1]
+            if rw == 0 or rh == 0: continue
+            
+            rotated_aspect = max(rw, rh) / min(rw, rh)
+            if rotated_aspect > 2.2: continue 
+            
+            rotated_extent = area / (rw * rh)
+            if rotated_extent > 0.85: continue 
+            
+            peri = cv2.arcLength(cnt, True)
+            if peri > 0:
+                circularity = 4.0 * np.pi * area / (peri**2)
+                if circularity >= 0.60: 
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    if hull_area > 0:
+                        solidity = area / float(hull_area)
+                        if solidity >= 0.85:
+                            raw_rects.append([x, y, x+w, y+h])
+                            raw_scores.append(score)
+    
+    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
+    if len(nms_boxes) == 0: return [], thick_lines_mask
 
-        # 五線近傍のみ
-        if min(abs(cy - c) for c in staff_centers) > staff_space * 3:
-            continue
+    final_boxes = []
+    stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
+    stem_check_h = int(staff_space * 1.5)
+    stem_check_w_ratio = 0.3 
 
-        raw_boxes.append([x, y, x + w, y + h])
-        raw_scores.append(score)
+    for box in nms_boxes:
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        cx = (x1 + x2) // 2
+        
+        stem_up_x1 = max(0, cx - int(w * stem_check_w_ratio / 2))
+        stem_up_x2 = min(thresh.shape[1], cx + int(w * stem_check_w_ratio / 2))
+        stem_up_y1 = max(0, y1 - stem_check_h)
+        stem_up_y2 = y1
+        
+        stem_down_x1 = stem_up_x1
+        stem_down_x2 = stem_up_x2
+        stem_down_y1 = y2
+        stem_down_y2 = min(thresh.shape[0], y2 + stem_check_h)
+        
+        has_stem = False
+        if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
+            opened_up = cv2.morphologyEx(thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2], cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_up) > 0: has_stem = True
+                
+        if stem_down_y2 > stem_down_y1 and stem_down_x2 > stem_down_x1:
+            opened_down = cv2.morphologyEx(thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2], cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_down) > 0: has_stem = True
+                
+        if has_stem:
+            # 🛑 3. 最後にマスクとの重なり判定で除外する
+            # 四角形の領域内に、ピンク色のマスクがどれくらい被っているか確認
+            box_mask = thick_lines_mask[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            area_box = max(1, box_mask.size)
+            overlap_ratio = np.count_nonzero(box_mask) / area_box
+            
+            # もし四角形の面積の30%以上がピンク色だったら、連桁や線の誤検知とみなしてポイ捨て
+            if overlap_ratio < 0.3:
+                final_boxes.append(box)
 
-    if not raw_boxes:
-        return [], beam_mask
-
-    boxes = nms_v8_strict(
-        np.array(raw_boxes),
-        np.array(raw_scores),
-        staff_space
-    )
-
-    return boxes, beam_mask
+    return np.array(final_boxes) if final_boxes else [], thick_lines_mask
 
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
