@@ -352,7 +352,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.45
+internal_threshold = 0.4999996
 
 st.write(internal_threshold)
 
