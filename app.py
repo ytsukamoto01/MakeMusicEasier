@@ -16,7 +16,6 @@ def detect_staff_groups_v8(pil_img):
     projection = np.sum(thresh, axis=1)
     
     peaks = []
-    # 【緩和1】最大の濃さの50%→30%でも線として拾う（薄い線への対応）
     thresh_val = np.max(projection) * 0.3 
     for i in range(1, len(projection) - 1):
         if projection[i] > thresh_val and projection[i] >= projection[i-1] and projection[i] >= projection[i+1]:
@@ -26,7 +25,6 @@ def detect_staff_groups_v8(pil_img):
     if peaks:
         curr = peaks[0]
         for i in range(1, len(peaks)):
-            # 【緩和2】太い線によるブレを吸収するため、近いピークの結合距離を広げる
             if peaks[i] - curr < 5: 
                 curr = (curr + peaks[i]) // 2
             else:
@@ -41,7 +39,6 @@ def detect_staff_groups_v8(pil_img):
         segment = merged[i:i+5]
         diffs = np.diff(segment)
         avg_spacing = np.mean(diffs)
-        # 【緩和3】五線の間隔の歪み許容度を25%→45%に大幅緩和（スキャンの歪み対応）
         if np.all(np.abs(diffs - avg_spacing) < avg_spacing * 0.45):
             staves.append(sorted(segment, reverse=True))
             i += 5
@@ -206,6 +203,7 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 # スライダーの初期値
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -221,16 +219,16 @@ for i, step_name in enumerate(steps):
         cols[i].markdown(f"⚪ {step_name}")
 st.divider()
 
-# サイドバー設定（検出感度のみに変更）
-st.sidebar.header("⚙️ 設定")
 # 表示サイズは内部で 800px に固定します
 FIXED_DISP_WIDTH = 800 
+# スライダーの値を元に検出閾値を計算
+internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
-if st.session_state.step == 1:
-    ui_sens = st.sidebar.slider("検出感度（大きいほど多く検出）", 1, 100, 50)
-    st.session_state.internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
+# PDFの処理（キャッシュ化されているので閾値が変わった時だけ再計算されます）
+if st.session_state.pdf_data:
+    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
 else:
-    st.sidebar.info("検出感度は Step 1（アップロード時）でのみ設定可能です。")
+    pages = []
 
 # ==========================================
 # STEP 1: アップロード
@@ -244,20 +242,18 @@ if st.session_state.step == 1:
         st.success("PDFを読み込みました！次へ進んでください。")
         st.button("次へ ➡️", on_click=next_step, type="primary")
 
-if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, st.session_state.get("internal_threshold", 0.65))
-else:
-    pages = []
-
 # ==========================================
 # STEP 2: ワンクリック自動調整
 # ==========================================
 if st.session_state.step == 2:
     col1, col2 = st.columns([1, 1])
     col1.subheader("Step 2: ワンクリック調整")
-    col1.info("💡 **操作:** 検出漏れの場所をクリックで追加。既存の音符の近くをクリックで削除。")
     col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
     col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
+
+    # ★感度スライダーをここに配置
+    st.slider("🔍 自動検出の感度（ページを見ながら調整できます）", 1, 100, key="ui_sens")
+    st.info("💡 **操作:** まずスライダーで良い感じの感度に合わせます。そのあと、検出漏れの場所をクリックで追加、既存の音符の近くをクリックで削除できます。")
 
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
