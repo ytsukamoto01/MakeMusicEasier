@@ -76,31 +76,12 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    # =========================================================
-    # ★【新機能】検知前の「禁止エリア（巨大ノイズ）」一括マスク処理
-    # ユーザー様のアイデアを完全実装しました！
-    # =========================================================
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
-    
-    for i in range(1, num_labels):
-        comp_w = stats[i, cv2.CC_STAT_WIDTH]
-        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
-        comp_area = stats[i, cv2.CC_STAT_AREA]
-        
-        # 音符のサイズ（通常 幅1.3、高さ1.0程度）を大きく超える塊を判定
-        # 横に長すぎる（斜めや水平の連桁）、縦に長すぎる（反復記号）、大きすぎる塊
-        if comp_w > staff_space * 2.8 or comp_h > staff_space * 4.5 or comp_area > staff_space ** 2 * 3.5:
-            # その塊を真っ黒に塗りつぶす（＝検知しないエリアにする）
-            filled[labels == i] = 0
-    # =========================================================
-
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
     
-    # 巨大ノイズが消え去った綺麗な画像に対して、マッチングを実施
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
-    loc = np.where(res >= threshold_val)
+    loc = np.where(res >= threshold_val) # 感度MAXの閾値で大量に候補を取得
 
     staff_centers = [np.mean(s) for s in staves]
     raw_rects, raw_scores = [], []
@@ -112,36 +93,58 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        patch = filled[y:y+h, x:x+w]
+        # 輪郭が途切れないよう少しマージンを取って切り抜く
+        margin = 2
+        px1, px2 = max(0, x - margin), min(filled.shape[1], x + w + margin)
+        py1, py2 = max(0, y - margin), min(filled.shape[0], y + h + margin)
+        patch = filled[py1:py2, px1:px2]
+        
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cnt = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(cnt)
+        if not contours: continue
+        
+        # パッチ中心に最も近い輪郭を対象とする
+        best_cnt = None
+        min_d = float('inf')
+        for c in contours:
+            M = cv2.moments(c)
+            if M["m00"] == 0: continue
+            mx, my = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+            d = math.hypot(mx - (cx - px1), my - (cy - py1))
+            if d < min_d:
+                min_d = d
+                best_cnt = c
+                
+        if best_cnt is None: continue
             
-            if area < (staff_space**2) * 0.3: continue
-            
-            rect = cv2.minAreaRect(cnt)
-            (rw, rh) = rect[1]
-            if rw == 0 or rh == 0: continue
-            
-            # アスペクト比と矩形度のチェック
-            rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.0: continue 
-            
-            rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.85: continue 
-            
-            peri = cv2.arcLength(cnt, True)
-            if peri > 0:
-                circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.65: 
-                    hull = cv2.convexHull(cnt)
-                    hull_area = cv2.contourArea(hull)
-                    if hull_area > 0:
-                        solidity = area / float(hull_area)
-                        if solidity >= 0.85:
-                            raw_rects.append([x, y, x+w, y+h])
-                            raw_scores.append(score)
+        area = cv2.contourArea(best_cnt)
+        if area < (staff_space**2) * 0.3: continue
+        
+        rect = cv2.minAreaRect(best_cnt)
+        (rw, rh) = rect[1]
+        if rw == 0 or rh == 0: continue
+        
+        # 1. 傾きを考慮したアスペクト比（斜めや縦の長い線を弾く）
+        # ※本物の音符を消さないよう 2.5 に緩和
+        rotated_aspect = max(rw, rh) / min(rw, rh)
+        if rotated_aspect > 2.5: continue 
+        
+        # 2. 矩形度（四角形にどれくらい詰まっているか）
+        # これが太い連桁や休符のブロックを弾く鍵になります
+        rotated_extent = area / (rw * rh)
+        if rotated_extent > 0.88: continue 
+        
+        # 3. 丸さと凸性のチェック（基本の検知力を維持するためマイルドに設定）
+        peri = cv2.arcLength(best_cnt, True)
+        if peri > 0:
+            circularity = 4.0 * np.pi * area / (peri**2)
+            if circularity >= 0.40: # 元の「丁度良い」緩さに戻しました
+                hull = cv2.convexHull(best_cnt)
+                hull_area = cv2.contourArea(hull)
+                if hull_area > 0:
+                    solidity = area / float(hull_area)
+                    if solidity >= 0.80:
+                        raw_rects.append([x, y, x+w, y+h])
+                        raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
@@ -330,7 +333,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-# 感度はMAX（閾値は最も低い0.45）に固定
+# 感度はMAX（閾値は最も低い0.45）に完全固定
 CONSTANT_THRESHOLD = 0.45
 
 if st.session_state.pdf_data:
