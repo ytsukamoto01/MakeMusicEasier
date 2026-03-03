@@ -76,17 +76,35 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    # 画像内の「黒い塊」ごとの大きさを計測
+    # =========================================================
+    # ★【新機能】検知前の「禁止エリア（巨大ノイズ）」一括マスク処理
+    # ユーザー様のアイデアを完全実装しました！
+    # =========================================================
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+    
+    for i in range(1, num_labels):
+        comp_w = stats[i, cv2.CC_STAT_WIDTH]
+        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+        comp_area = stats[i, cv2.CC_STAT_AREA]
+        
+        # 音符のサイズ（通常 幅1.3、高さ1.0程度）を大きく超える塊を判定
+        # 横に長すぎる（斜めや水平の連桁）、縦に長すぎる（反復記号）、大きすぎる塊
+        if comp_w > staff_space * 2.8 or comp_h > staff_space * 4.5 or comp_area > staff_space ** 2 * 3.5:
+            # その塊を真っ黒に塗りつぶす（＝検知しないエリアにする）
+            filled[labels == i] = 0
+    # =========================================================
 
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
+    
+    # 巨大ノイズが消え去った綺麗な画像に対して、マッチングを実施
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= threshold_val)
 
     staff_centers = [np.mean(s) for s in staves]
     raw_rects, raw_scores = [], []
+    
     for (x, y) in zip(*loc[::-1]):
         w, h = nw, nh
         score = res[y, x]
@@ -94,22 +112,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        # 連桁（ビーム）や縦棒の排除ロジック（強化）
-        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
-        label = labels[cy, cx]
-        if label == 0: continue # 背景
-        
-        comp_w = stats[label, cv2.CC_STAT_WIDTH]
-        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
-        comp_area = stats[label, cv2.CC_STAT_AREA]   # ← 追加：成分の面積
-        
-        # 塊の幅が「音符3.5個分」より広い場合は連桁（ビーム）やタイとみなして除外
-        if comp_w > staff_space * 3.5: continue
-        # 塊の高さが異常に高い場合は縦の反復記号や音部記号とみなして除外
-        if comp_h > staff_space * 5.5: continue
-        # 【新規】成分の面積が大きすぎる場合（音符3個分以上）は除外（連桁・反復記号対策）
-        if comp_area > staff_space ** 2 * 3.0: continue
-
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
@@ -122,7 +124,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             (rw, rh) = rect[1]
             if rw == 0 or rh == 0: continue
             
-            # アスペクト比の閾値を 2.2 → 2.0 に厳格化
+            # アスペクト比と矩形度のチェック
             rotated_aspect = max(rw, rh) / min(rw, rh)
             if rotated_aspect > 2.0: continue 
             
@@ -131,7 +133,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
-                # 円形度の閾値を 0.60 → 0.65 に引き上げ
                 circularity = 4.0 * np.pi * area / (peri**2)
                 if circularity >= 0.65: 
                     hull = cv2.convexHull(cnt)
@@ -313,7 +314,6 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 200 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -330,10 +330,11 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
+# 感度はMAX（閾値は最も低い0.45）に固定
+CONSTANT_THRESHOLD = 0.45
 
 if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
+    pages = process_pdf_and_detect(st.session_state.pdf_data, CONSTANT_THRESHOLD)
 else:
     pages = []
 
@@ -351,14 +352,13 @@ if st.session_state.step == 2:
     subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
     subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
 
-    img_container_col, slider_container_col = st.columns([4, 1]) 
+    img_container_col, guide_container_col = st.columns([4, 1]) 
 
-    with slider_container_col:
+    with guide_container_col:
         st.write("### ") 
-        st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
+        st.subheader("🖱️ 操作ガイド")
+        st.info("💡 現在、検出感度は最高（100）に自動設定されています。")
         st.divider()
-        st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
             st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
