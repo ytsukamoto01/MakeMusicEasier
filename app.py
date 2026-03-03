@@ -97,28 +97,27 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             cnt = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(cnt)
             
-            # 極端に小さいノイズを除外
             if area < (staff_space**2) * 0.3: continue
             
-            # 【修正1】輪郭の正確なバウンディングボックスを取得し、アスペクト比を計算
             bx, by, bw, bh = cv2.boundingRect(cnt)
             if bw == 0 or bh == 0: continue
             
             cnt_aspect = bw / float(bh)
-            if not (0.8 <= cnt_aspect <= 2.2): continue # 細長すぎるもの（連桁）を弾く
+            if not (0.8 <= cnt_aspect <= 2.2): continue
+            
+            # ★ ユーザー様のアイデアを実装：「太い直線（四角形）」の除外フィルタ
+            extent = area / float(bw * bh)
+            if extent > 0.85: continue # 枠の85%以上が黒で埋まっている＝丸ではなく四角や太い直線とみなす
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
-                # 【修正2】円形度を厳しく判定 (0.40 -> 0.65)
                 circularity = 4.0 * np.pi * area / (peri**2)
                 if circularity >= 0.65:
-                    
-                    # 【修正3】Solidity(凸性)のチェックを追加 (へこんだ形を弾く)
                     hull = cv2.convexHull(cnt)
                     hull_area = cv2.contourArea(hull)
                     if hull_area > 0:
                         solidity = area / float(hull_area)
-                        if solidity >= 0.85: # 音符はほぼ完全な凸型なので高い値になる
+                        if solidity >= 0.85:
                             raw_rects.append([x, y, x+w, y+h])
                             raw_scores.append(score)
     
@@ -126,7 +125,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     if len(nms_boxes) == 0: return []
 
-    # ト音記号・ヘ音記号の誤検知回避（符幹の確認ロジックはそのまま）
+    # ト音記号・ヘ音記号の誤検知回避（符幹の確認）
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
