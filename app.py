@@ -66,130 +66,202 @@ def nms_v8_strict(boxes, scores, staff_space):
     return boxes[pick].astype("int")
 
 def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
+    # 1. ぼかし＋2値化
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # 符幹を切断し、分離した連桁をサイズで捨てる
+    _, thresh = cv2.threshold(
+        blurred, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
+    # 2. 符幹を切断し、連桁をサイズで除外
     sever_k_size = max(2, int(staff_space * 0.35))
-    sever_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size))
+    sever_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size)
+    )
     severed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, sever_k)
-    
-    num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(severed, connectivity=8)
+
+    num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(
+        severed, connectivity=8
+    )
     notes_only = np.zeros_like(thresh)
-    
+
     for label in range(1, num_labels):
         w = stats_sev[label, cv2.CC_STAT_WIDTH]
         h = stats_sev[label, cv2.CC_STAT_HEIGHT]
         area = stats_sev[label, cv2.CC_STAT_AREA]
-        
-        # [微調整] 音符の幅を大きく超える横長のもの（斜線・横線の連桁）を除外する条件を強化 (3.5 -> 2.5)
-        if w > staff_space * 2.5: continue
-        if h > staff_space * 5.0: continue
-        if area > staff_space**2 * 4.0: continue
-        if area < staff_space**2 * 0.3: continue
-        
+
+        # --- サイズで連桁・装飾記号を除外（かなり強め） ---
+        if w > staff_space * 2.0:
+            continue
+        if h > staff_space * 4.0:
+            continue
+        if area > staff_space**2 * 3.0:
+            continue
+        # 小さすぎる点・アクセントを除外
+        if area < staff_space**2 * 0.4:
+            continue
+
         notes_only[labels_sev == label] = 255
-        
+
+    # 3. クロージングで白抜き音符を埋める
     close_k_size = max(2, int(staff_space * 0.4))
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
+    close_k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (close_k_size, close_k_size)
+    )
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+    # 4. ラベリング
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        filled, connectivity=8
+    )
 
+    # 5. テンプレートマッチング用テンプレート
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
-    cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
+    cv2.ellipse(
+        template,
+        (nw // 2, nh // 2),
+        (nw // 2 - 1, nh // 2 - 1),
+        -20, 0, 360, 255, -1
+    )
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= threshold_val)
 
     staff_centers = [np.mean(s) for s in staves]
+
     raw_rects, raw_scores = [], []
     for (x, y) in zip(*loc[::-1]):
         w, h = nw, nh
         score = res[y, x]
-        cx, cy = x + w//2, y + h//2
-        
+        cx, cy = x + w // 2, y + h // 2
+
+        # 五線から遠いものは音符ではない
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
-        if dist_to_nearest_staff > staff_space * 4.0: continue
-        
-        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
-        label = labels[cy, cx]
-        if label == 0: continue
-        
-        comp_w = stats[label, cv2.CC_STAT_WIDTH]
-        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
-        comp_area = stats[label, cv2.CC_STAT_AREA]
-        
-        if comp_w > staff_space * 3.5: continue
-        if comp_h > staff_space * 5.5: continue
-        if comp_area > staff_space ** 2 * 3.0: continue
+        if dist_to_nearest_staff > staff_space * 3.0:
+            continue
 
-        patch = filled[y:y+h, x:x+w]
-        contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cnt = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(cnt)
-            
-            if area < (staff_space**2) * 0.3: continue
-            
-            rect = cv2.minAreaRect(cnt)
-            (rw, rh) = rect[1]
-            if rw == 0 or rh == 0: continue
-            
-            rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.0: continue 
-            
-            rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.85: continue 
-            
-            peri = cv2.arcLength(cnt, True)
-            if peri > 0:
-                circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.65: 
-                    hull = cv2.convexHull(cnt)
-                    hull_area = cv2.contourArea(hull)
-                    if hull_area > 0:
-                        solidity = area / float(hull_area)
-                        if solidity >= 0.85:
-                            raw_rects.append([x, y, x+w, y+h])
-                            raw_scores.append(score)
-    
-    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
-    
-    if len(nms_boxes) == 0: return []
+        if cy >= labels.shape[0] or cx >= labels.shape[1]:
+            continue
+        label_id = labels[cy, cx]
+        if label_id == 0:
+            continue
 
+        comp_w = stats[label_id, cv2.CC_STAT_WIDTH]
+        comp_h = stats[label_id, cv2.CC_STAT_HEIGHT]
+        comp_area = stats[label_id, cv2.CC_STAT_AREA]
+
+        # ここでもう一度サイズで絞る
+        if comp_w > staff_space * 3.0:
+            continue
+        if comp_h > staff_space * 5.0:
+            continue
+        if comp_area > staff_space**2 * 2.5:
+            continue
+        if comp_area < staff_space**2 * 0.4:
+            continue
+
+        patch = filled[y:y + h, x:x + w]
+        contours, _ = cv2.findContours(
+            patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            continue
+
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        if area < (staff_space**2) * 0.4:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        (rw, rh) = rect[1]
+        if rw == 0 or rh == 0:
+            continue
+
+        # 横長楕円っぽいものだけ残す
+        rotated_aspect = max(rw, rh) / min(rw, rh)
+        if rotated_aspect < 1.1 or rotated_aspect > 2.0:
+            continue
+
+        rotated_extent = area / (rw * rh)
+        if rotated_extent > 0.85:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
+            continue
+        circularity = 4.0 * np.pi * area / (peri ** 2)
+        # 丸に近すぎる（装飾音の小さな丸など）は削る
+        if circularity > 0.70:
+            continue
+
+        # 凸包率が高すぎるもの（丸に近い）も削る
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area > 0:
+            solidity = area / float(hull_area)
+            if solidity > 0.85:
+                continue
+
+        raw_rects.append([x, y, x + w, y + h])
+        raw_scores.append(score)
+
+    # 6. NMS
+    if not raw_rects:
+        return []
+
+    nms_boxes = nms_v8_strict(
+        np.array(raw_rects), np.array(raw_scores), staff_space
+    )
+    if len(nms_boxes) == 0:
+        return []
+
+    # 7. 「必ず幹がある」ものだけ最終採用
     final_boxes = []
-    stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
-    stem_check_h = int(staff_space * 1.5)
-    stem_check_w_ratio = 0.3 
+    stem_k = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(3, int(staff_space * 0.6)))
+    )
+    stem_check_h = int(staff_space * 2.0)
+    stem_check_w_ratio = 0.25
 
     for box in nms_boxes:
         x1, y1, x2, y2 = box
         w = x2 - x1
         cx = (x1 + x2) // 2
-        
+
         stem_up_x1 = max(0, cx - int(w * stem_check_w_ratio / 2))
         stem_up_x2 = min(thresh.shape[1], cx + int(w * stem_check_w_ratio / 2))
         stem_up_y1 = max(0, y1 - stem_check_h)
         stem_up_y2 = y1
-        
+
         stem_down_x1 = stem_up_x1
         stem_down_x2 = stem_up_x2
         stem_down_y1 = y2
         stem_down_y2 = min(thresh.shape[0], y2 + stem_check_h)
-        
+
         has_stem = False
         if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
-            opened_up = cv2.morphologyEx(thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2], cv2.MORPH_OPEN, stem_k)
-            if np.sum(opened_up) > 0: has_stem = True
-                
+            opened_up = cv2.morphologyEx(
+                thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2],
+                cv2.MORPH_OPEN, stem_k
+            )
+            if np.sum(opened_up) > 0:
+                has_stem = True
+
         if stem_down_y2 > stem_down_y1 and stem_down_x2 > stem_down_x1:
-            opened_down = cv2.morphologyEx(thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2], cv2.MORPH_OPEN, stem_k)
-            if np.sum(opened_down) > 0: has_stem = True
-                
-        if has_stem: final_boxes.append(box)
+            opened_down = cv2.morphologyEx(
+                thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2],
+                cv2.MORPH_OPEN, stem_k
+            )
+            if np.sum(opened_down) > 0:
+                has_stem = True
+
+        # 幹が無いものは「♪ではない」とみなして削除
+        if has_stem:
+            final_boxes.append(box)
 
     return np.array(final_boxes) if final_boxes else []
+
 
 # ===== [修正箇所] ヘ音記号の音階マッピングを修正 =====
 def get_pitch_name(note_y, staff, clef):
