@@ -76,6 +76,9 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
+    # 🛑【追加】画像内の「黒い塊」ごとの大きさを計測する
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
@@ -91,6 +94,19 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
+        # 🛑【追加】連桁（ビーム）や縦棒の排除ロジック
+        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        label = labels[cy, cx]
+        if label == 0: continue # 背景
+        
+        comp_w = stats[label, cv2.CC_STAT_WIDTH]
+        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
+        
+        # 塊の幅が「音符3.5個分」より広い場合は、連桁（ビーム）やタイとみなして除外
+        if comp_w > staff_space * 3.5: continue
+        # 塊の高さが異常に高い場合は、縦の反復記号や音部記号とみなして除外
+        if comp_h > staff_space * 5.5: continue
+
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
@@ -99,23 +115,20 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             
             if area < (staff_space**2) * 0.3: continue
             
-            # ★【変更】斜めの線に対応するため「傾きを考慮した最小外接矩形」を取得
             rect = cv2.minAreaRect(cnt)
-            (rw, rh) = rect[1] # 回転枠の幅と高さ
+            (rw, rh) = rect[1]
             if rw == 0 or rh == 0: continue
             
-            # 1. 傾きを考慮したアスペクト比（斜めの細い線を弾く）
             rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.2: continue # 音符は傾いても細長くならない
+            if rotated_aspect > 2.2: continue 
             
-            # 2. 傾きを考慮した矩形度（斜めの太いブロックを弾く）
             rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.85: continue # 斜めの直線もこれで「四角に詰まっている」と判断され弾かれる
+            if rotated_extent > 0.85: continue 
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
                 circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.60: # 斜め対策により円形度を少しだけ緩和
+                if circularity >= 0.60: 
                     hull = cv2.convexHull(cnt)
                     hull_area = cv2.contourArea(hull)
                     if hull_area > 0:
