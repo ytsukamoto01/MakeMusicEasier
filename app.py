@@ -124,24 +124,61 @@ def get_pitch_name(note_y, staff, clef, flats_count):
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, flats_count):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
+    
+    font_size = max(15, int(space))
     try:
-        font = ImageFont.truetype("NotoSansJP-Regular.ttf", max(15, int(space)))
+        font = ImageFont.truetype("NotoSansJP-Regular.ttf", font_size)
     except:
         font = ImageFont.load_default()
+
+    # ★追加：文字の重なりを防ぐための記録リスト
+    drawn_text_rects = []
 
     def draw_label(x, yc, is_custom=False):
         s_idx = np.argmin([abs(np.mean(s) - yc) for s in staves])
         clef = "treble" if s_idx % 2 == 0 else "bass"
         p_name, is_flat = get_pitch_name(yc, staves[s_idx], clef, flats_count)
+        
         if p_name:
+            # 枠線の描画
             box_color = (255, 165, 0) if is_custom else (0, 255, 0)
             hw, hh = int(space * 0.6), int(space * 0.5)
             b = [x - hw, yc - hh, x + hw, yc + hh]
             draw.rectangle(b, outline=box_color, width=2)
+            
+            # 文字色
             color = (0, 0, 255) if is_flat else (255, 0, 0)
-            draw.text((b[0], b[1] - int(space * 1.6)), p_name, font=font, fill=color)
+            
+            # 初期描画位置
+            text_x = b[0]
+            text_y = b[1] - int(space * 1.6)
+            
+            # テキストの幅と高さを概算（重なり判定用）
+            # 日本語フォントの場合、1文字の幅はフォントサイズとほぼ同じ
+            text_w = len(p_name) * font_size
+            text_h = font_size
+            
+            # ★追加：重なり（衝突）判定ループ
+            while True:
+                is_overlapping = False
+                for (rx, ry, rw, rh) in drawn_text_rects:
+                    # 矩形同士の重なりをチェック
+                    if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
+                        is_overlapping = True
+                        break
+                
+                if is_overlapping:
+                    # 重なっている場合は右にズラす
+                    text_x += int(font_size * 1.1)
+                else:
+                    # 重ならない場所が見つかったらループを抜ける
+                    break
 
-    # 自動検出分の描画（削除リストに入っているものはスキップ）
+            # 決定した位置に文字を描画し、リストに記録
+            draw.text((text_x, text_y), p_name, font=font, fill=color)
+            drawn_text_rects.append((text_x, text_y, text_w, text_h))
+
+    # 自動検出分の描画
     for box in auto_notes:
         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
         is_deleted = False
@@ -155,6 +192,7 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
     # 手動追加分の描画
     for (cx, yc) in custom_clicks:
         draw_label(cx, yc, True)
+        
     return result
 
 @st.cache_data(show_spinner=False)
@@ -198,14 +236,12 @@ if up:
             
             value = streamlit_image_coordinates(res_img, key=f"img_{i}", width=disp_width)
             
-            # 🛑【修正箇所】無限ループ防止ストッパー
             last_click_key = f"last_click_{i}"
             if last_click_key not in st.session_state:
                 st.session_state[last_click_key] = None
             
-            # 「まだ処理していない新しいクリック」の場合のみ実行
             if value and value != st.session_state[last_click_key]:
-                st.session_state[last_click_key] = value # 処理済みとして記録
+                st.session_state[last_click_key] = value
                 
                 clicked_x, clicked_y = value["x"], value["y"]
                 scale = page["image"].width / disp_width
@@ -244,7 +280,6 @@ if up:
     if st.button("手動編集をすべてリセット"):
         st.session_state.custom_clicks = {}
         st.session_state.deleted_auto_notes = {}
-        # リセットボタンを押した時、各ページの最後にクリックした履歴も消去します
         for key in list(st.session_state.keys()):
             if key.startswith("last_click_"):
                 del st.session_state[key]
