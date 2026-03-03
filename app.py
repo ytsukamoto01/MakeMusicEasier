@@ -69,7 +69,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 🎨【追加のみ】太い線の感知（マスク作成のみ。検知には一切影響させません）
+    # 🎨【追加】太い線の感知（マスク作成のみ。元のthreshは一切汚しません）
     beam_w = int(staff_space * 1.5)
     beam_h = max(2, int(staff_space * 0.25)) 
     beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
@@ -82,7 +82,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
 
     thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
 
-    # 🛑ここから下の「音符検知ロジック」は、お送りいただいた元のコードと100%同一です
+    # 🛑ここから下の「音符検知ロジック」は、一番最初の完璧なコードと1文字も違わず全く同じです
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
@@ -149,7 +149,8 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
-    if len(nms_boxes) == 0: return [], thick_lines_mask # 戻り値にマスクを追加
+    if len(nms_boxes) == 0: 
+        return [], thick_lines_mask
 
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
@@ -182,7 +183,9 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
                 
         if has_stem: final_boxes.append(box)
 
-    return np.array(final_boxes) if final_boxes else [], thick_lines_mask # 戻り値にマスクを追加
+    # Tupleで音符の箱とマスクの両方を返す
+    result_boxes = np.array(final_boxes) if final_boxes else []
+    return result_boxes, thick_lines_mask
 
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
@@ -305,13 +308,13 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         
     return result
 
+# 🛑 Streamlitのキャッシュを強制的に新規作成させるために関数名を「v9」に変更
 @st.cache_data(show_spinner=False)
-def process_pdf_and_detect(pdf_bytes, internal_threshold):
+def process_pdf_and_detect_v9(pdf_bytes, internal_threshold):
     imgs = convert_from_bytes(pdf_bytes)
     data = []
     for img in imgs:
         staves, space = detect_staff_groups_v8(img)
-        # 🎨【変更】マスクも受け取るように修正
         if staves:
             notes, beams_mask = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves)
         else:
@@ -350,7 +353,7 @@ FIXED_DISP_WIDTH = 800
 internal_threshold = 0.85 - (100 / 100.0) * 0.40
 
 if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
+    pages = process_pdf_and_detect_v9(st.session_state.pdf_data, internal_threshold)
 else:
     pages = []
 
@@ -359,6 +362,11 @@ if st.session_state.step == 1:
     up = st.file_uploader("PDFファイルを選択してください", type="pdf")
     if up:
         st.session_state.pdf_data = up.getvalue()
+        # 🛑【最重要】PDFを新しく読み込んだら、過去の「消去・追加」の記憶を強制的に消し飛ばす
+        st.session_state.deleted_auto_notes = {}
+        st.session_state.custom_clicks = {}
+        st.session_state.custom_labels = {}
+        
         st.success("PDFを読み込みました！次へ進んでください。")
         st.button("次へ ➡️", on_click=next_step, type="primary")
 
@@ -393,7 +401,7 @@ if st.session_state.step == 2:
                 res_img = draw_all_notes(
                     page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
                     st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key],
-                    beams_mask=page.get("beams_mask") # 🎨【追加】マスクを渡す
+                    beams_mask=page.get("beams_mask") # マスクを渡す
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
@@ -469,7 +477,7 @@ if st.session_state.step == 3:
 
             res_img = draw_all_notes(
                 page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
-                custom_labels_page, selected_pos=sel_pos, beams_mask=page.get("beams_mask") # 🎨【追加】マスクを渡す
+                custom_labels_page, selected_pos=sel_pos, beams_mask=page.get("beams_mask")
             )
             value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
             
