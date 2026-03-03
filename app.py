@@ -106,7 +106,8 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     return nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
 
-def get_pitch_name(note_y, staff, clef, flats_count):
+# 【変更点】引数から flats_count を削除し、純粋な音階のみを返すようにしました
+def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
     step_size = abs(line1 - line5) / 8.0
     steps = int(round((line1 - note_y) / step_size))
@@ -114,14 +115,12 @@ def get_pitch_name(note_y, staff, clef, flats_count):
         mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
     else:
         mapping = {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}
-    name = mapping.get(steps, "")
-    flat_order = ["シ", "ミ", "ラ", "レ", "ソ", "ド", "ファ"]
-    return name, name in flat_order[:flats_count]
+    return mapping.get(steps, "")
 
 # ==========================================
 # 2. 描画・キャッシュ処理
 # ==========================================
-def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, flats_count):
+def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
     
@@ -131,54 +130,43 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
     except:
         font = ImageFont.load_default()
 
-    # ★追加：文字の重なりを防ぐための記録リスト
     drawn_text_rects = []
 
     def draw_label(x, yc, is_custom=False):
         s_idx = np.argmin([abs(np.mean(s) - yc) for s in staves])
         clef = "treble" if s_idx % 2 == 0 else "bass"
-        p_name, is_flat = get_pitch_name(yc, staves[s_idx], clef, flats_count)
+        p_name = get_pitch_name(yc, staves[s_idx], clef)
         
         if p_name:
-            # 枠線の描画
             box_color = (255, 165, 0) if is_custom else (0, 255, 0)
             hw, hh = int(space * 0.6), int(space * 0.5)
             b = [x - hw, yc - hh, x + hw, yc + hh]
             draw.rectangle(b, outline=box_color, width=2)
             
-            # 文字色
-            color = (0, 0, 255) if is_flat else (255, 0, 0)
+            # 【変更点】文字色をすべて赤（255, 0, 0）に固定
+            color = (255, 0, 0)
             
-            # 初期描画位置
             text_x = b[0]
             text_y = b[1] - int(space * 1.6)
             
-            # テキストの幅と高さを概算（重なり判定用）
-            # 日本語フォントの場合、1文字の幅はフォントサイズとほぼ同じ
             text_w = len(p_name) * font_size
             text_h = font_size
             
-            # ★追加：重なり（衝突）判定ループ
             while True:
                 is_overlapping = False
                 for (rx, ry, rw, rh) in drawn_text_rects:
-                    # 矩形同士の重なりをチェック
                     if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
                         is_overlapping = True
                         break
                 
                 if is_overlapping:
-                    # 重なっている場合は右にズラす
                     text_x += int(font_size * 1.1)
                 else:
-                    # 重ならない場所が見つかったらループを抜ける
                     break
 
-            # 決定した位置に文字を描画し、リストに記録
             draw.text((text_x, text_y), p_name, font=font, fill=color)
             drawn_text_rects.append((text_x, text_y, text_w, text_h))
 
-    # 自動検出分の描画
     for box in auto_notes:
         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
         is_deleted = False
@@ -189,7 +177,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         if not is_deleted:
             draw_label(cx, cy, False)
 
-    # 手動追加分の描画
     for (cx, yc) in custom_clicks:
         draw_label(cx, yc, True)
         
@@ -218,7 +205,7 @@ if "deleted_auto_notes" not in st.session_state:
     st.session_state.deleted_auto_notes = {}
 
 st.sidebar.header("⚙️ 設定")
-flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4)
+# 【変更点】調号のセレクトボックスを削除しました
 ui_sens = st.sidebar.slider("検出感度", 1, 100, 50)
 internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
 disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800)
@@ -232,7 +219,8 @@ if up:
             clicks = st.session_state.custom_clicks.get(i, [])
             deleted_auto = st.session_state.deleted_auto_notes.get(i, [])
             
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], flats)
+            # 【変更点】引数から flats を削除しました
+            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"])
             
             value = streamlit_image_coordinates(res_img, key=f"img_{i}", width=disp_width)
             
