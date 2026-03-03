@@ -89,7 +89,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     _, line_mask = cv2.threshold(line_mask, 127, 255, cv2.THRESH_BINARY)
     # ========================================
 
-    open_k_size = max(3, int(staff_space * 0.4))
+    open_k_size = max(3, int(staff_space * 0.8))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
     close_k_size = max(3, int(staff_space * 0.3))
