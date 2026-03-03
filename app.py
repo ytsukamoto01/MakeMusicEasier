@@ -80,11 +80,14 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
+    
+    # 閾値以上の位置を特定
     loc = np.where(res >= threshold_val)
 
     staff_centers = [np.mean(s) for s in staves]
     raw_rects, raw_scores = [], []
     
+    # 隔離チェック用のマージン
     chk_w = int(staff_space * 2.5)
     chk_h = int(staff_space * 3.5)
     img_h, img_w = filled.shape
@@ -96,96 +99,65 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        chk_x1 = max(0, cx - chk_w // 2)
-        chk_x2 = min(img_w, cx + chk_w // 2)
-        chk_y1 = max(0, cy - chk_h // 2)
-        chk_y2 = min(img_h, cy + chk_h // 2)
+        # 1. 広い窓での隔離チェック（連桁/長い線の排除）
+        chk_x1, chk_x2 = max(0, cx - chk_w // 2), min(img_w, cx + chk_w // 2)
+        chk_y1, chk_y2 = max(0, cy - chk_h // 2), min(img_h, cy + chk_h // 2)
         
         patch_check = filled[chk_y1:chk_y2, chk_x1:chk_x2]
         contours, _ = cv2.findContours(patch_check, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours: continue
         
-        pcx = cx - chk_x1
-        pcy = cy - chk_y1
-        
+        pcx, pcy = cx - chk_x1, cy - chk_y1
         best_cnt = None
         min_dist = float('inf')
         for c_ in contours:
             M = cv2.moments(c_)
             if M["m00"] == 0: continue
-            mx = int(M["m10"] / M["m00"])
-            my = int(M["m01"] / M["m00"])
-            dist = math.hypot(mx - pcx, my - pcy)
+            dist = math.hypot(int(M["m10"]/M["m00"]) - pcx, int(M["m01"]/M["m00"]) - pcy)
             if dist < min_dist:
                 min_dist = dist
                 best_cnt = c_
                 
         if best_cnt is None or min_dist > staff_space * 0.8: continue
         
+        # 窓の端に触れていたらノイズ
         ph, pw = patch_check.shape
         bx, by, bw, bh = cv2.boundingRect(best_cnt)
-        touch_margin = 1
-        if bx <= touch_margin or by <= touch_margin or (bx + bw) >= pw - touch_margin or (by + bh) >= ph - touch_margin:
+        if bx <= 1 or by <= 1 or (bx + bw) >= pw - 1 or (by + bh) >= ph - 1:
             continue
             
+        # 2. 形状チェック
         area = cv2.contourArea(best_cnt)
         if area < (staff_space**2) * 0.3: continue
         
         rect = cv2.minAreaRect(best_cnt)
         (rw, rh) = rect[1]
         if rw == 0 or rh == 0: continue
-        
-        rotated_aspect = max(rw, rh) / min(rw, rh)
-        if rotated_aspect > 2.2: continue 
-        
-        rotated_extent = area / (rw * rh)
-        if rotated_extent > 0.88: continue 
+        if max(rw, rh) / min(rw, rh) > 2.2: continue 
+        if area / (rw * rh) > 0.88: continue 
         
         peri = cv2.arcLength(best_cnt, True)
-        if peri > 0:
-            circularity = 4.0 * np.pi * area / (peri**2)
-            if circularity >= 0.55: 
-                hull = cv2.convexHull(best_cnt)
-                hull_area = cv2.contourArea(hull)
-                if hull_area > 0:
-                    solidity = area / float(hull_area)
-                    if solidity >= 0.85:
-                        raw_rects.append([cx - w//2, cy - h//2, cx + w//2, cy + h//2])
-                        raw_scores.append(score)
+        if peri > 0 and (4.0 * np.pi * area / (peri**2)) >= 0.55:
+            hull = cv2.convexHull(best_cnt)
+            if cv2.contourArea(hull) > 0 and (area / cv2.contourArea(hull)) >= 0.85:
+                raw_rects.append([cx - w//2, cy - h//2, cx + w//2, cy + h//2])
+                raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
-    
-    if len(nms_boxes) == 0: return []
+    if not nms_boxes.any(): return []
 
+    # 3. 符幹チェック
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
-    stem_check_h = int(staff_space * 1.5)
-    stem_check_w_ratio = 0.3 
-
     for box in nms_boxes:
         x1, y1, x2, y2 = box
-        w = x2 - x1
-        cx = (x1 + x2) // 2
-        
-        stem_up_x1 = max(0, cx - int(w * stem_check_w_ratio / 2))
-        stem_up_x2 = min(thresh.shape[1], cx + int(w * stem_check_w_ratio / 2))
-        stem_up_y1 = max(0, y1 - stem_check_h)
-        stem_up_y2 = y1
-        
-        stem_down_x1 = stem_up_x1
-        stem_down_x2 = stem_up_x2
-        stem_down_y1 = y2
-        stem_down_y2 = min(thresh.shape[0], y2 + stem_check_h)
-        
+        cx, w = (x1 + x2) // 2, x2 - x1
         has_stem = False
-        if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
-            opened_up = cv2.morphologyEx(thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2], cv2.MORPH_OPEN, stem_k)
-            if np.sum(opened_up) > 0: has_stem = True
-                
-        if stem_down_y2 > stem_down_y1 and stem_down_x2 > stem_down_x1:
-            opened_down = cv2.morphologyEx(thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2], cv2.MORPH_OPEN, stem_k)
-            if np.sum(opened_down) > 0: has_stem = True
-                
+        for (sy1, sy2) in [(max(0, y1-int(staff_space*1.5)), y1), (y2, min(thresh.shape[0], y2+int(staff_space*1.5)))]:
+            sx1, sx2 = max(0, cx-int(w*0.15)), min(thresh.shape[1], cx+int(w*0.15))
+            if sy2 > sy1 and sx2 > sx1:
+                if np.sum(cv2.morphologyEx(thresh[sy1:sy2, sx1:sx2], cv2.MORPH_OPEN, stem_k)) > 0:
+                    has_stem = True; break
         if has_stem: final_boxes.append(box)
 
     return np.array(final_boxes) if final_boxes else []
@@ -194,11 +166,9 @@ def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
     step_size = abs(line1 - line5) / 8.0
     steps = int(round((line1 - note_y) / step_size))
-    if clef == "treble":
-        mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
-    else:
-        mapping = {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}
-    return mapping.get(steps, "")
+    mapping = {"treble": {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"},
+               "bass": {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}}
+    return mapping[clef].get(steps, "")
 
 # ==========================================
 # 2. 描画・キャッシュ処理 
@@ -206,110 +176,65 @@ def get_pitch_name(note_y, staff, clef):
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
-    
     font_size = max(15, int(space))
-    try:
-        font = ImageFont.truetype("NotoSansJP-Regular.ttf", font_size)
-    except:
-        font = ImageFont.load_default()
+    try: font = ImageFont.truetype("NotoSansJP-Regular.ttf", font_size)
+    except: font = ImageFont.load_default()
 
-    drawn_text_rects = []
-
-    active_notes = []
+    drawn_text_rects, active_notes = [], []
     for box in auto_notes:
         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
         if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
             s_idx = np.argmin([abs(np.mean(s) - cy) for s in staves])
             active_notes.append({"x": cx, "y": cy, "s_idx": s_idx, "is_custom": False})
-            
     for cx, cy in custom_clicks:
         s_idx = np.argmin([abs(np.mean(s) - cy) for s in staves])
         active_notes.append({"x": int(cx), "y": int(cy), "s_idx": s_idx, "is_custom": True})
 
     active_notes.sort(key=lambda n: (n["s_idx"], n["x"]))
-    
     groups = []
     for note in active_notes:
-        if not groups:
-            groups.append([note])
+        if not groups: groups.append([note])
         else:
-            last_group = groups[-1]
-            avg_x = sum(n["x"] for n in last_group) / len(last_group)
-            if abs(note["x"] - avg_x) < space * 0.8 and note["s_idx"] == last_group[0]["s_idx"]:
-                last_group.append(note)
-            else:
-                groups.append([note])
+            last = groups[-1]
+            if abs(note["x"] - (sum(n["x"] for n in last)/len(last))) < space * 0.8 and note["s_idx"] == last[0]["s_idx"]:
+                last.append(note)
+            else: groups.append([note])
 
     for group in groups:
         group.sort(key=lambda n: n["y"]) 
-        labels_to_draw = []
-        
+        labels = []
         for note in group:
-            x, y, s_idx, is_custom = note["x"], note["y"], note["s_idx"], note["is_custom"]
-            clef = "treble" if s_idx % 2 == 0 else "bass"
-            
-            p_name = None
-            for (lx, ly), label in custom_labels.items():
-                if math.hypot(x - lx, y - ly) < 2.0:
-                    p_name = label
-                    break
-            if p_name is None:
-                p_name = get_pitch_name(y, staves[s_idx], clef)
-                
-            if p_name:
-                labels_to_draw.append(p_name)
-                
+            p_name = next((l for (lx, ly), l in custom_labels.items() if math.hypot(note["x"]-lx, note["y"]-ly) < 2.0), None)
+            if p_name is None: p_name = get_pitch_name(note["y"], staves[note["s_idx"]], "treble" if note["s_idx"] % 2 == 0 else "bass")
+            if p_name: labels.append(p_name)
             if not hide_boxes:
-                box_color = (255, 165, 0) if is_custom else (0, 255, 0)
                 hw, hh = int(space * 0.6), int(space * 0.5)
-                b = [x - hw, y - hh, x + hw, y + hh]
-                
-                if selected_pos and math.hypot(x - selected_pos[0], y - selected_pos[1]) < 2:
-                    draw.rectangle(b, outline=(0, 0, 255), width=4)
-                else:
-                    draw.rectangle(b, outline=box_color, width=2)
+                color = (0,0,255) if (selected_pos and math.hypot(note["x"]-selected_pos[0], note["y"]-selected_pos[1]) < 2) else ((255,165,0) if note["is_custom"] else (0,255,0))
+                draw.rectangle([note["x"]-hw, note["y"]-hh, note["x"]+hw, note["y"]+hh], outline=color, width=2 if color != (0,0,255) else 4)
 
-        if labels_to_draw and (not hide_boxes or any(l for l in labels_to_draw)):
-            min_y = group[0]["y"]
-            group_avg_x = sum(n["x"] for n in group) / len(group)
-            
-            combined_text = " ".join(labels_to_draw)
-            
-            text_x = group_avg_x - int(space * 0.6)
-            text_y = min_y - int(space * 1.6)
-            text_w = len(combined_text) * font_size
-            text_h = font_size
-            
-            while True:
-                is_overlapping = False
-                for (rx, ry, rw, rh) in drawn_text_rects:
-                    if not (text_x + text_w < rx or text_x > rx + rw or text_y + text_h < ry or text_y > ry + rh):
-                        is_overlapping = True
-                        break
-                if is_overlapping:
-                    text_x += int(font_size * 1.1)
-                else:
-                    break
-                    
-            draw.text((text_x, text_y), combined_text, font=font, fill=(255, 0, 0))
-            drawn_text_rects.append((text_x, text_y, text_w, text_h))
+        if labels and (not hide_boxes or any(labels)):
+            combined = " ".join(labels)
+            tx, ty = group[0]["x"] - int(space*0.6), group[0]["y"] - int(space*1.6)
+            tw, th = len(combined)*font_size, font_size
+            while any(not (tx + tw < rx or tx > rx + rw or ty + th < ry or ty > ry + rh) for (rx,ry,rw,rh) in drawn_text_rects):
+                tx += int(font_size * 1.1)
+            draw.text((tx, ty), combined, font=font, fill=(255, 0, 0))
+            drawn_text_rects.append((tx, ty, tw, th))
 
     if erase_start and not hide_boxes:
         ex, ey = erase_start
         r = max(4, int(space * 0.4))
         draw.ellipse([ex - r, ey - r, ex + r, ey + r], fill=(255, 0, 0))
-        draw.line((ex, 0, ex, result.height), fill=(255, 0, 0), width=1)
-        draw.line((0, ey, result.width, ey), fill=(255, 0, 0), width=1)
-        
+        draw.line((ex, 0, ex, result.height), fill=(255, 0, 0), width=1); draw.line((0, ey, result.width, ey), fill=(255, 0, 0), width=1)
     return result
 
 @st.cache_data(show_spinner=False)
-def process_pdf_and_detect(pdf_bytes, internal_threshold):
+def process_pdf_and_detect(pdf_bytes, threshold):
     imgs = convert_from_bytes(pdf_bytes)
     data = []
     for img in imgs:
         staves, space = detect_staff_groups_v8(img)
-        notes = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else []
+        notes = detect_note_heads_v8(np.array(img.convert('L')), space, threshold, staves) if staves else []
         data.append({"image": img, "staves": staves, "space": space, "notes": notes})
     return data
 
@@ -317,172 +242,117 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
 # 3. Streamlit UI
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
-
-if "step" not in st.session_state: st.session_state.step = 1
-if "custom_clicks" not in st.session_state: st.session_state.custom_clicks = {}
-if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_notes = {}
-if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
-if "selected_note" not in st.session_state: st.session_state.selected_note = None 
-if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
+for k in ["step", "custom_clicks", "deleted_auto_notes", "custom_labels", "selected_note", "pdf_data"]:
+    if k not in st.session_state: st.session_state[k] = (1 if k=="step" else (None if k in ["selected_note","pdf_data"] else {}))
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
 
 st.title("🎼 ドレミ付与ツール V8")
-
 steps = ["1. アップロード", "2. ワンクリック調整", "3. マニュアル微調整", "4. プレビュー＆保存"]
 cols = st.columns(4)
-for i, step_name in enumerate(steps):
-    if st.session_state.step == i + 1:
-        cols[i].markdown(f"**🔵 {step_name}**")
-    else:
-        cols[i].markdown(f"⚪ {step_name}")
+for i, s in enumerate(steps): cols[i].markdown(f"**🔵 {s}**" if st.session_state.step == i+1 else f"⚪ {s}")
 st.divider()
 
-FIXED_DISP_WIDTH = 800 
-# 🛑【修正箇所】感度を 100 固定にする（0.85 - (100 / 100.0) * 0.40 = 0.45）
-CONSTANT_THRESHOLD = 0.45
+# 🛑 修正箇所: 感度100に対応する低閾値 (0.40) に固定
+FIXED_THRESHOLD = 0.40
+FIXED_WIDTH = 800
 
-if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, CONSTANT_THRESHOLD)
-else:
-    pages = []
+if st.session_state.pdf_data: pages = process_pdf_and_detect(st.session_state.pdf_data, FIXED_THRESHOLD)
+else: pages = []
 
 if st.session_state.step == 1:
     st.subheader("Step 1: 楽譜PDFをアップロード")
     up = st.file_uploader("PDFファイルを選択してください", type="pdf")
     if up:
         st.session_state.pdf_data = up.getvalue()
-        st.success("PDFを読み込みました！次へ進んでください。")
-        st.button("次へ ➡️", on_click=next_step, type="primary")
+        st.success("読込完了！"); st.button("次へ ➡️", on_click=next_step, type="primary")
 
 if st.session_state.step == 2:
-    subheader_col1, subheader_col2 = st.columns([2, 1])
-    subheader_col1.subheader("Step 2: 自動検出の調整")
-    subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
-    subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
-
-    # 🛑【修正箇所】スライダーをなくして操作ガイドのみ表示
-    img_container_col, guide_container_col = st.columns([4, 1]) 
-
-    with guide_container_col:
-        st.write("### ") 
-        st.subheader("🖱️ 操作ガイド")
-        st.info("💡 現在、検出感度は最高（100）に設定されています。")
-        st.divider()
-        edit_mode = st.radio("クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
-        if "範囲消去" in edit_mode:
-            st.warning("⚠️ **範囲消去モード**\nエリアの「左上」と「右下」をクリック。")
-
-    with img_container_col:
+    h1, h2 = st.columns([2, 1])
+    h1.subheader("Step 2: 自動検出の調整")
+    h2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary"); h2.button("⬅️ やり直す", on_click=prev_step)
+    c1, c2 = st.columns([4, 1])
+    with c2:
+        st.write("### "); st.subheader("🖱️ 操作ガイド"); st.info("💡 検出感度は最高(100)固定です。")
+        mode = st.radio("動作", ["👆 通常", "🔲 範囲消去"])
+    with c1:
         for i, page in enumerate(pages):
             st.write(f"### ページ {i + 1}")
             if page["staves"]:
-                clicks = st.session_state.custom_clicks.setdefault(i, [])
-                deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
-                
-                erase_start_key = f"s2_erase_start_{i}"
-                if erase_start_key not in st.session_state: st.session_state[erase_start_key] = None
-                if "範囲消去" not in edit_mode: st.session_state[erase_start_key] = None
-
-                res_img = draw_all_notes(
-                    page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
-                    st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key]
-                )
-                
-                value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
-                last_click_key = f"s2_last_click_{i}"
-                if last_click_key not in st.session_state: st.session_state[last_click_key] = None
-                
-                if value and value != st.session_state[last_click_key]:
-                    st.session_state[last_click_key] = value 
-                    scale = page["image"].width / FIXED_DISP_WIDTH
-                    real_x, real_y = value["x"] * scale, value["y"] * scale
-                    
-                    if "範囲消去" in edit_mode:
-                        if st.session_state[erase_start_key] is None:
-                            st.session_state[erase_start_key] = (real_x, real_y)
+                clicks, deleted = st.session_state.custom_clicks.setdefault(i, []), st.session_state.deleted_auto_notes.setdefault(i, [])
+                es_key = f"s2_es_{i}"
+                if es_key not in st.session_state: st.session_state[es_key] = None
+                if "範囲消去" not in mode: st.session_state[es_key] = None
+                res = draw_all_notes(page["image"], page["notes"], clicks, deleted, page["staves"], page["space"], st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[es_key])
+                val = streamlit_image_coordinates(res, key=f"s2_img_{i}", width=FIXED_WIDTH)
+                lc_key = f"s2_lc_{i}"
+                if val and val != st.session_state.get(lc_key):
+                    st.session_state[lc_key] = val
+                    rx, ry = val["x"] * (page["image"].width / FIXED_WIDTH), val["y"] * (page["image"].width / FIXED_WIDTH)
+                    if "範囲消去" in mode:
+                        if st.session_state[es_key] is None: st.session_state[es_key] = (rx, ry)
                         else:
-                            x1, y1 = st.session_state[erase_start_key]
-                            x2, y2 = real_x, real_y
-                            min_x, max_x, min_y, max_y = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
-                            clicks[:] = [pt for pt in clicks if not (min_x <= pt[0] <= max_x and min_y <= pt[1] <= max_y)]
-                            for box in page["notes"]:
-                                cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                                if min_x <= cx <= max_x and min_y <= cy <= max_y:
-                                    if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
-                                        deleted_auto.append((cx, cy))
-                            st.session_state[erase_start_key] = None
+                            x1, y1 = st.session_state[es_key]; x2, y2 = rx, ry
+                            clicks[:] = [p for p in clicks if not (min(x1,x2) <= p[0] <= max(x1,x2) and min(y1,y2) <= p[1] <= max(y1,y2))]
+                            for b in page["notes"]:
+                                cx, cy = (b[0]+b[2])//2, (b[1]+b[3])//2
+                                if min(x1,x2) <= cx <= max(x1,x2) and min(y1,y2) <= cy <= max(y1,y2):
+                                    if not any(math.hypot(cx-dx,cy-dy) < 2.0 for dx,dy in deleted): deleted.append((cx,cy))
+                            st.session_state[es_key] = None
                     else:
-                        hit_threshold_x, hit_threshold_y = page["space"] * 0.8, page["space"] * 0.45 
-                        action_taken = False
-                        for pt in clicks.copy():
-                            if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y:
-                                clicks.remove(pt); action_taken = True; break
-                        if not action_taken:
-                            for box in page["notes"]:
-                                cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                                if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
-                                    if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y:
-                                        deleted_auto.append((cx, cy)); action_taken = True; break
-                        if not action_taken: clicks.append((real_x, real_y))
-                    st.rerun() 
-            else:
-                st.warning(f"⚠️ ページ {i+1} 五線検出不能"); st.image(page["image"], width=FIXED_DISP_WIDTH)
+                        hit_x, hit_y = page["space"]*0.8, page["space"]*0.45
+                        done = False
+                        for p in clicks.copy():
+                            if abs(rx-p[0]) < hit_x and abs(ry-p[1]) < hit_y: clicks.remove(p); done=True; break
+                        if not done:
+                            for b in page["notes"]:
+                                cx, cy = (b[0]+b[2])//2, (b[1]+b[3])//2
+                                if not any(math.hypot(cx-dx,cy-dy) < 2.0 for dx,dy in deleted):
+                                    if abs(rx-cx) < hit_x and abs(ry-cy) < hit_y: deleted.append((cx,cy)); done=True; break
+                        if not done: clicks.append((rx, ry))
+                    st.rerun()
+            else: st.warning(f"⚠️ ページ {i+1} 五線検出不能"); st.image(page["image"], width=FIXED_WIDTH)
 
 if st.session_state.step == 3:
-    col1, col2 = st.columns([1, 1])
-    col1.subheader("Step 3: マニュアル微調整")
-    col2.button("次へ：完成プレビュー ➡️", on_click=next_step, type="primary")
-    col2.button("⬅️ 戻る (Step 2へ)", on_click=prev_step)
-
-    for i, page in enumerate(pages):
-        st.write(f"### ページ {i + 1}")
-        if page["staves"]:
-            clicks, deleted_auto = st.session_state.custom_clicks.get(i, []), st.session_state.deleted_auto_notes.get(i, [])
-            custom_labels_page = st.session_state.custom_labels.setdefault(i, {})
-            sel_pos = (st.session_state.selected_note["x"], st.session_state.selected_note["y"]) if st.session_state.selected_note and st.session_state.selected_note["page"] == i else None
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], custom_labels_page, selected_pos=sel_pos)
-            value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
-            last_click_key = f"s3_last_click_{i}"
-            if last_click_key not in st.session_state: st.session_state[last_click_key] = None
-            if value and value != st.session_state[last_click_key]:
-                st.session_state[last_click_key] = value
-                scale = page["image"].width / FIXED_DISP_WIDTH
-                real_x, real_y = value["x"] * scale, value["y"] * scale
-                hit_threshold_x, hit_threshold_y = page["space"] * 0.8, page["space"] * 0.45 
-                found_note = None
-                for pt in clicks:
-                    if abs(real_x - pt[0]) < hit_threshold_x and abs(real_y - pt[1]) < hit_threshold_y: found_note = (int(pt[0]), int(pt[1])); break
-                if not found_note:
-                    for box in page["notes"]:
-                        cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
-                        if not any(math.hypot(cx - dx, cy - dy) < 2.0 for dx, dy in deleted_auto):
-                            if abs(real_x - cx) < hit_threshold_x and abs(real_y - cy) < hit_threshold_y: found_note = (cx, cy); break
-                if not found_note: clicks.append((real_x, real_y)); found_note = (int(real_x), int(real_y))
-                current_label = custom_labels_page.get(found_note)
-                if current_label is None:
-                    s_idx = np.argmin([abs(np.mean(s) - found_note[1]) for s in page["staves"]])
-                    current_label = get_pitch_name(found_note[1], page["staves"][s_idx], "treble" if s_idx % 2 == 0 else "bass")
-                st.session_state.selected_note = {"page": i, "x": found_note[0], "y": found_note[1], "label": current_label}; st.rerun()
+    col1, col2 = st.columns([1, 1]); col1.subheader("Step 3: マニュアル微調整")
+    col2.button("次へ：完成プレビュー ➡️", on_click=next_step, type="primary"); col2.button("⬅️ 戻る", on_click=prev_step)
+    for i, p in enumerate(pages):
+        st.write(f"### ページ {i+1}")
+        if p["staves"]:
+            clicks, deleted = st.session_state.custom_clicks.get(i, []), st.session_state.deleted_auto_notes.get(i, [])
+            labels = st.session_state.custom_labels.setdefault(i, {})
+            sel_p = (st.session_state.selected_note["x"], st.session_state.selected_note["y"]) if st.session_state.selected_note and st.session_state.selected_note["page"] == i else None
+            res = draw_all_notes(p["image"], p["notes"], clicks, deleted, p["staves"], p["space"], labels, selected_pos=sel_p)
+            val = streamlit_image_coordinates(res, key=f"s3_img_{i}", width=FIXED_WIDTH)
+            lc_key = f"s3_lc_{i}"
+            if val and val != st.session_state.get(lc_key):
+                st.session_state[lc_key] = val
+                rx, ry = val["x"] * (p["image"].width / FIXED_WIDTH), val["y"] * (p["image"].width / FIXED_WIDTH)
+                hit_x, hit_y = p["space"]*0.8, p["space"]*0.45
+                found = next((pt for pt in clicks if abs(rx-pt[0]) < hit_x and abs(ry-pt[1]) < hit_y), None)
+                if not found:
+                    found_box = next((b for b in p["notes"] if not any(math.hypot((b[0]+b[2])/2-dx,(b[1]+b[3])/2-dy) < 2.0 for dx,dy in deleted) and abs(rx-(b[0]+b[2])/2) < hit_x and abs(ry-(b[1]+b[3])/2) < hit_y), None)
+                    if found_box: found = ((found_box[0]+found_box[2])//2, (found_box[1]+found_box[3])//2)
+                if not found: st.session_state.custom_clicks[i].append((rx,ry)); found=(int(rx),int(ry))
+                cur_l = labels.get(found)
+                if cur_l is None:
+                    idx = np.argmin([abs(np.mean(s)-found[1]) for s in p["staves"]])
+                    cur_l = get_pitch_name(found[1], p["staves"][idx], "treble" if idx % 2 == 0 else "bass")
+                st.session_state.selected_note = {"page":i, "x":found[0], "y":found[1], "label":cur_l}; st.rerun()
             if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
                 sel = st.session_state.selected_note
-                new_label = st.text_input(f"✎ ページ {i+1} テキスト変更", value=sel["label"], key=f"input_{i}")
-                if new_label != sel["label"]: custom_labels_page[(sel["x"], sel["y"])] = new_label; st.session_state.selected_note["label"] = new_label; st.rerun()
-        else: st.image(page["image"], width=FIXED_DISP_WIDTH)
+                new_l = st.text_input(f"✎ ページ {i+1} テキスト変更", value=sel["label"], key=f"in_{i}")
+                if new_l != sel["label"]: labels[(sel["x"], sel["y"])] = new_l; st.session_state.selected_note["label"] = new_l; st.rerun()
+        else: st.image(p["image"], width=FIXED_WIDTH)
 
 if st.session_state.step == 4:
-    st.subheader("Step 4: 完成プレビュー")
-    col1, col2 = st.columns([1, 1])
-    col2.button("⬅️ 戻る (Step 3へ)", on_click=prev_step)
-    out_images = []
-    for i, page in enumerate(pages):
-        st.write(f"### ページ {i + 1}")
-        if page["staves"]:
-            res_img = draw_all_notes(page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], st.session_state.custom_labels.get(i, {}), hide_boxes=True)
-            out_images.append(res_img); st.image(res_img, width=FIXED_DISP_WIDTH)
-        else: out_images.append(page["image"]); st.image(page["image"], width=FIXED_DISP_WIDTH)
-    if out_images:
-        pdf_buffer = io.BytesIO()
-        out_images[0].save(pdf_buffer, format="PDF", save_all=True, append_images=out_images[1:])
-        st.download_button("📥 楽譜PDFをダウンロード", data=pdf_buffer.getvalue(), file_name="score_with_notes.pdf", mime="application/pdf", type="primary", use_container_width=True)
+    st.subheader("Step 4: 完成プレビュー"); c1, c2 = st.columns([1, 1]); c2.button("⬅️ 戻る", on_click=prev_step)
+    out = []
+    for i, p in enumerate(pages):
+        if p["staves"]:
+            res = draw_all_notes(p["image"], p["notes"], st.session_state.custom_clicks.get(i,[]), st.session_state.deleted_auto_notes.get(i,[]), p["staves"], p["space"], st.session_state.custom_labels.get(i,{}), hide_boxes=True)
+            out.append(res); st.image(res, width=FIXED_WIDTH)
+        else: out.append(p["image"]); st.image(p["image"], width=FIXED_WIDTH)
+    if out:
+        buf = io.BytesIO(); out[0].save(buf, format="PDF", save_all=True, append_images=out[1:]); st.download_button("📥 楽譜PDFをダウンロード", data=buf.getvalue(), file_name="score.pdf", mime="application/pdf", type="primary", use_container_width=True)
