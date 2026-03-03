@@ -352,7 +352,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.4999996
+internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
 st.write(internal_threshold)
 
@@ -380,7 +380,7 @@ if st.session_state.step == 2:
     with slider_container_col:
         st.write("### ") 
         st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
+        st.slider("🔍 検出感度", 1, 100, value=100, key="ui_sens")
         st.divider()
         st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
