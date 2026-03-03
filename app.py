@@ -203,7 +203,7 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 # スライダーの初期値
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 100 # スライダーの初期値
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
