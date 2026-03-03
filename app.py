@@ -99,20 +99,23 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
             
             if area < (staff_space**2) * 0.3: continue
             
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            if bw == 0 or bh == 0: continue
+            # ★【変更】斜めの線に対応するため「傾きを考慮した最小外接矩形」を取得
+            rect = cv2.minAreaRect(cnt)
+            (rw, rh) = rect[1] # 回転枠の幅と高さ
+            if rw == 0 or rh == 0: continue
             
-            cnt_aspect = bw / float(bh)
-            if not (0.8 <= cnt_aspect <= 2.2): continue
+            # 1. 傾きを考慮したアスペクト比（斜めの細い線を弾く）
+            rotated_aspect = max(rw, rh) / min(rw, rh)
+            if rotated_aspect > 2.2: continue # 音符は傾いても細長くならない
             
-            # ★ ユーザー様のアイデアを実装：「太い直線（四角形）」の除外フィルタ
-            extent = area / float(bw * bh)
-            if extent > 0.85: continue # 枠の85%以上が黒で埋まっている＝丸ではなく四角や太い直線とみなす
+            # 2. 傾きを考慮した矩形度（斜めの太いブロックを弾く）
+            rotated_extent = area / (rw * rh)
+            if rotated_extent > 0.85: continue # 斜めの直線もこれで「四角に詰まっている」と判断され弾かれる
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
                 circularity = 4.0 * np.pi * area / (peri**2)
-                if circularity >= 0.65:
+                if circularity >= 0.60: # 斜め対策により円形度を少しだけ緩和
                     hull = cv2.convexHull(cnt)
                     hull_area = cv2.contourArea(hull)
                     if hull_area > 0:
@@ -125,7 +128,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     if len(nms_boxes) == 0: return []
 
-    # ト音記号・ヘ音記号の誤検知回避（符幹の確認）
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
