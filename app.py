@@ -307,13 +307,13 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 
-if "step" not in st.session_state: st.session_state.step = 100
+if "step" not in st.session_state: st.session_state.step = 1
 if "custom_clicks" not in st.session_state: st.session_state.custom_clicks = {}
 if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_notes = {}
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 100 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
