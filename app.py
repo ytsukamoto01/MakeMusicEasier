@@ -1,4 +1,4 @@
-こちらは音符を感知して音階を振るツールですが、「連桁（れんこう）」という太い横線や、縦の太い反復記号に沿って、大量の四角が誤検知されてしまいます。どうすればよいでしょうか。コードを修正してまるまるコピペできるように書き直してくださいimport streamlit as st
+import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -325,7 +325,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
+internal_threshold = 0.85 - (100 / 100.0) * 0.40
 
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
@@ -349,10 +349,6 @@ if st.session_state.step == 2:
     img_container_col, slider_container_col = st.columns([4, 1]) 
 
     with slider_container_col:
-        st.write("### ") 
-        st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
-        st.divider()
         st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
