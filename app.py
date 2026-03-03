@@ -144,10 +144,9 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
     # 自動検出分の描画（削除リストに入っているものはスキップ）
     for box in auto_notes:
         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-        # 削除リストに含まれていないかチェック
         is_deleted = False
         for dx, dy in deleted_auto:
-            if math.hypot(cx - dx, cy - dy) < 1.0: # 同じ座標なら
+            if math.hypot(cx - dx, cy - dy) < 1.0:
                 is_deleted = True
                 break
         if not is_deleted:
@@ -160,7 +159,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
 
 @st.cache_data(show_spinner=False)
 def process_pdf_and_detect(pdf_bytes, internal_threshold):
-    """PDF変換と自動検出をキャッシュする関数（必須）"""
     imgs = convert_from_bytes(pdf_bytes)
     data = []
     for img in imgs:
@@ -176,7 +174,6 @@ st.set_page_config(page_title="ドレミ付与 V8", layout="wide")
 st.title("🎼 ドレミ付与ツール V8")
 st.info("💡 **操作方法:** 検出漏れの場所をクリックすると追加されます。すでにある音符（枠線）の近くをクリックすると削除されます。")
 
-# セッションステートの初期化（追加分と削除分）
 if "custom_clicks" not in st.session_state:
     st.session_state.custom_clicks = {}
 if "deleted_auto_notes" not in st.session_state:
@@ -190,7 +187,6 @@ disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800)
 
 up = st.file_uploader("PDFをアップロード", type="pdf")
 if up:
-    # 欠けていた process_pdf_and_detect 関数を呼び出します
     pages = process_pdf_and_detect(up.read(), internal_threshold)
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
@@ -202,17 +198,22 @@ if up:
             
             value = streamlit_image_coordinates(res_img, key=f"img_{i}", width=disp_width)
             
-            if value:
-                clicked_x, clicked_y = value["x"], value["y"]
+            # 🛑【修正箇所】無限ループ防止ストッパー
+            last_click_key = f"last_click_{i}"
+            if last_click_key not in st.session_state:
+                st.session_state[last_click_key] = None
+            
+            # 「まだ処理していない新しいクリック」の場合のみ実行
+            if value and value != st.session_state[last_click_key]:
+                st.session_state[last_click_key] = value # 処理済みとして記録
                 
-                # スケール調整（表示サイズと元画像の比率を計算）
+                clicked_x, clicked_y = value["x"], value["y"]
                 scale = page["image"].width / disp_width
                 real_x, real_y = clicked_x * scale, clicked_y * scale
                 
-                click_threshold = page["space"] * 1.5 # これより近くをクリックしたら「削除」と判定
+                click_threshold = page["space"] * 1.5 
                 action_taken = False
 
-                # 1. まず「手動追加した音符」の近くをクリックしたかチェック（手動分の削除）
                 for pt in clicks.copy():
                     if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
                         clicks.remove(pt)
@@ -220,7 +221,6 @@ if up:
                         action_taken = True
                         break
 
-                # 2. 次に「自動検出された音符」の近くをクリックしたかチェック（自動分の削除）
                 if not action_taken:
                     for box in page["notes"]:
                         cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
@@ -232,18 +232,20 @@ if up:
                             action_taken = True
                             break
 
-                # 3. どちらの音符の近くでもなければ「新規追加」
                 if not action_taken:
                     if i not in st.session_state.custom_clicks: 
                         st.session_state.custom_clicks[i] = []
                     st.session_state.custom_clicks[i].append((real_x, real_y))
                 
-                st.rerun() # 画面を更新
+                st.rerun() 
         else:
             st.image(page["image"], width=disp_width)
 
-    # リセットボタン
     if st.button("手動編集をすべてリセット"):
         st.session_state.custom_clicks = {}
         st.session_state.deleted_auto_notes = {}
+        # リセットボタンを押した時、各ページの最後にクリックした履歴も消去します
+        for key in list(st.session_state.keys()):
+            if key.startswith("last_click_"):
+                del st.session_state[key]
         st.rerun()
