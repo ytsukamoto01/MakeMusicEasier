@@ -352,7 +352,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0
+internal_threshold = 0.01
 
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
