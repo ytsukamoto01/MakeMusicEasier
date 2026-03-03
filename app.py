@@ -6,7 +6,7 @@ import io
 from pdf2image import convert_from_bytes
 
 # ==========================================
-# 1. 楽譜解析エンジン（V8：幾何学フィルタリング再調整版）
+# 1. 楽譜解析エンジン（V8：五線除去＆高精度検出版）
 # ==========================================
 
 def detect_staff_groups_v8(pil_img):
@@ -33,7 +33,7 @@ def detect_staff_groups_v8(pil_img):
 
     staves = []
     i = 0
-    avg_spacing = 10  # デフォルト値
+    avg_spacing = 10
     while i <= len(merged) - 5:
         segment = merged[i:i+5]
         diffs = np.diff(segment)
@@ -75,14 +75,34 @@ def nms_v8_strict(boxes, scores, staff_space):
 def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
 
+    # 1. 2値化
     _, thresh = cv2.threshold(
         blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    k = int(staff_space * 0.5)
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    filled = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_k)
+    # ==========================================
+    # ★追加：五線（横線）の除去プロセス
+    # ==========================================
+    # 横長のカーネルを作成（五線の幅より少し長いくらい）
+    line_width = int(staff_space * 1.5)
+    line_height = max(1, int(staff_space * 0.2)) # 線の太さ
+    horizontal_k = cv2.getStructuringElement(cv2.MORPH_RECT, (line_width, line_height))
+    
+    # 横線だけを抽出
+    staff_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_k)
+    
+    # 元の画像から横線を引く（五線が消え、音符が上下に分断される）
+    thresh_no_lines = cv2.subtract(thresh, staff_lines)
 
+    # ==========================================
+    # 2. クロージングで分断された音符を修復＆白抜きを埋める
+    # ==========================================
+    # 大きめの丸いカーネルで、削れた音符を復元
+    k = int(staff_space * 0.9)
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    filled = cv2.morphologyEx(thresh_no_lines, cv2.MORPH_CLOSE, close_k)
+
+    # 3. テンプレートマッチング
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(
@@ -100,7 +120,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     loc = np.where(res >= threshold_val)
 
     staff_centers = [np.mean(s) for s in staves]
-
     raw_rects = []
     raw_scores = []
 
@@ -111,24 +130,20 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         x1, y1, x2, y2 = x, y, x + w, y + h
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-        # 1) 五線からの距離
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0:
             continue
 
-        # 2) 矩形のアスペクト比（★ここを厳格化：縦長であるフラットなどを確実に除外）
         aspect = w / float(h)
-        if not (1.1 <= aspect <= 2.2):
+        if not (1.0 <= aspect <= 2.2):
             continue
 
-        # 3) 面積チェック
         area = w * h
-        if area < (staff_space**2) * 0.3:
+        if area < (staff_space**2) * 0.4:
             continue
         if area > (staff_space**2) * 3.5:
             continue
 
-        # 4) 輪郭の丸さチェック
         patch = filled[max(0, y1):y2, max(0, x1):x2]
         contours, _ = cv2.findContours(
             patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -144,9 +159,9 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         if perimeter == 0:
             continue
 
-        # 丸さ（★少し厳しく戻し、いびつすぎる記号を弾く）
+        # 横線が消えてきれいな丸になるため、条件を少し厳しくして記号を確実に弾く
         circularity = 4.0 * np.pi * cnt_area / (perimeter**2)
-        if circularity < 0.40:  
+        if circularity < 0.45:  
             continue
 
         raw_rects.append([x1, y1, x2, y2])
@@ -221,15 +236,13 @@ def process_page_v8(pil_img, internal_threshold, flats_count):
 # ==========================================
 
 st.set_page_config(page_title="ドレミ付与 V8", layout="centered")
-st.title("🎼 ドレミ付与ツール V8 (音符限定モード)")
-st.write("ト音記号やペダル記号などの「音符ではないもの」を、形・位置・大きさでできるだけ除外します。")
+st.title("🎼 ドレミ付与ツール V8 (五線除去・高精度モード)")
+st.write("内部で五線を消去することで、フラットなどの記号を除外したまま、音符だけを強力に検出します。")
 
 st.sidebar.header("⚙️ 設定")
 flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4)
 
 ui_sens = st.sidebar.slider("検出感度（1〜100：大きいほどたくさん検出）", min_value=1, max_value=100, value=50, step=1)
-
-# ★感度が上がりすぎてゴミを拾わないよう、しきい値の変換幅を調整（0.85〜0.55）
 internal_threshold = 0.85 - (ui_sens / 100.0) * 0.30
 
 up = st.file_uploader("PDFをアップロード", type="pdf")
