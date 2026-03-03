@@ -180,7 +180,12 @@ if up:
         if page["staves"]:
             clicks = st.session_state.custom_clicks.get(i, [])
             res_img = draw_all_notes(page["image"], page["notes"], clicks, page["staves"], page["space"], flats)
-            value = streamlit_image_coordinates(res_img, key=f"img_{i}")
+            value = streamlit_image_coordinates(
+                res_img, 
+                key=f"img_{i}",
+                width=700,  # ここで表示幅を固定します（ピクセル単位）
+                use_column_width=True # または、コンテナの幅に合わせる
+            )
             if value:
                 new_click = (value["x"], value["y"])
                 if new_click not in clicks:
