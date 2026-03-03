@@ -335,7 +335,7 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 150
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -380,7 +380,7 @@ if st.session_state.step == 2:
     with slider_container_col:
         st.write("### ") 
         st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, value=100, key="ui_sens")
+        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
         st.divider()
         st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
