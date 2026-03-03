@@ -11,40 +11,40 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 # 1. 楽譜解析エンジン (V8 ロジック + 連桁サイズ除外方式)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
-    img_array = np.array(pil_img.convert('L'))
-    _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    projection = np.sum(thresh, axis=1)
-    
-    peaks = []
-    thresh_val = np.max(projection) * 0.3 
-    for i in range(1, len(projection) - 1):
-        if projection[i] > thresh_val and projection[i] >= projection[i-1] and projection[i] >= projection[i+1]:
-            peaks.append(i)
+    img_array = np.array(pil_img.convert('L'))
+    _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    projection = np.sum(thresh, axis=1)
+    
+    peaks = []
+    thresh_val = np.max(projection) * 0.3 
+    for i in range(1, len(projection) - 1):
+        if projection[i] > thresh_val and projection[i] >= projection[i-1] and projection[i] >= projection[i+1]:
+            peaks.append(i)
 
-    merged = []
-    if peaks:
-        curr = peaks[0]
-        for i in range(1, len(peaks)):
-            if peaks[i] - curr < 5: 
-                curr = (curr + peaks[i]) // 2
-            else:
-                merged.append(curr)
-                curr = peaks[i]
-        merged.append(curr)
+    merged = []
+    if peaks:
+        curr = peaks[0]
+        for i in range(1, len(peaks)):
+            if peaks[i] - curr < 5: 
+                curr = (curr + peaks[i]) // 2
+            else:
+                merged.append(curr)
+                curr = peaks[i]
+        merged.append(curr)
 
-    staves = []
-    i = 0
-    avg_spacing = 10
-    while i <= len(merged) - 5:
-        segment = merged[i:i+5]
-        diffs = np.diff(segment)
-        avg_spacing = np.mean(diffs)
-        if np.all(np.abs(diffs - avg_spacing) < avg_spacing * 0.45):
-            staves.append(sorted(segment, reverse=True))
-            i += 5
-        else:
-            i += 1
-    return staves, avg_spacing if staves else 10
+    staves = []
+    i = 0
+    avg_spacing = 10
+    while i <= len(merged) - 5:
+        segment = merged[i:i+5]
+        diffs = np.diff(segment)
+        avg_spacing = np.mean(diffs)
+        if np.all(np.abs(diffs - avg_spacing) < avg_spacing * 0.45):
+            staves.append(sorted(segment, reverse=True))
+            i += 5
+        else:
+            i += 1
+    return staves, avg_spacing if staves else 10
 
 def nms_v8_strict(boxes, scores, staff_space):
     if len(boxes) == 0:
