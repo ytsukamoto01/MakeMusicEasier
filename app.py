@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (V8 ロジック + 連桁サイズ除外方式)
+# 1. 楽譜解析エンジン (統合版)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -69,11 +69,9 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # =========================================================
-    # [追加] 太い線（連桁や太い縦線など）の感知と除外
-    # =========================================================
+    # 🛑【Code 2の統合】太い線（連桁や太い縦線）の感知と除外
     beam_w = int(staff_space * 1.5)
-    beam_h = max(2, int(staff_space * 0.25))
+    beam_h = max(2, int(staff_space * 0.25)) 
     beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
     thick_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, beam_k)
 
@@ -82,33 +80,16 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     v_beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (v_beam_w, v_beam_h))
     thick_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_beam_k)
 
+    # 太い直線のマスクを作成し、元の画像から引き算する
     thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
-    
-    # 太い線を画像から引き算して除外
     thresh_for_notes = cv2.subtract(thresh, thick_lines_mask)
-    # =========================================================
+
+    # 🛑【Code 1の統合】精密な形状解析による音符判定
+    open_k_size = max(3, int(staff_space * 0.6))
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
+    notes_only = cv2.morphologyEx(thresh_for_notes, cv2.MORPH_OPEN, open_k) # 線を除去した画像にかける
     
-    # 符幹を切断
-    sever_k_size = max(2, int(staff_space * 0.35))
-    sever_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size))
-    severed = cv2.morphologyEx(thresh_for_notes, cv2.MORPH_OPEN, sever_k)
-    
-    num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(severed, connectivity=8)
-    notes_only = np.zeros_like(thresh_for_notes)
-    
-    for label in range(1, num_labels):
-        w = stats_sev[label, cv2.CC_STAT_WIDTH]
-        h = stats_sev[label, cv2.CC_STAT_HEIGHT]
-        area = stats_sev[label, cv2.CC_STAT_AREA]
-        
-        if w > staff_space * 2.5: continue
-        if h > staff_space * 5.0: continue
-        if area > staff_space**2 * 4.0: continue
-        if area < staff_space**2 * 0.3: continue
-        
-        notes_only[labels_sev == label] = 255
-        
-    close_k_size = max(2, int(staff_space * 0.4))
+    close_k_size = max(3, int(staff_space * 0.3))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
@@ -126,59 +107,53 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         w, h = nw, nh
         score = res[y, x]
         cx, cy = x + w//2, y + h//2
-        
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
         if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
         label = labels[cy, cx]
-        if label == 0: continue
+        if label == 0: continue # 背景
         
         comp_w = stats[label, cv2.CC_STAT_WIDTH]
         comp_h = stats[label, cv2.CC_STAT_HEIGHT]
-        comp_area = stats[label, cv2.CC_STAT_AREA]
         
         if comp_w > staff_space * 3.5: continue
         if comp_h > staff_space * 5.5: continue
-        if comp_area > staff_space ** 2 * 3.0: continue
 
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(cnt)
-            
             if area < (staff_space**2) * 0.3: continue
             
             rect = cv2.minAreaRect(cnt)
             (rw, rh) = rect[1]
             if rw == 0 or rh == 0: continue
             
-            # ★【修正ポイント】形状判定の条件を全体的に緩和しました
             rotated_aspect = max(rw, rh) / min(rw, rh)
-            if rotated_aspect > 2.5: continue 
+            if rotated_aspect > 2.2: continue 
             
             rotated_extent = area / (rw * rh)
-            if rotated_extent > 0.95 or rotated_extent < 0.4: continue 
+            if rotated_extent > 0.85: continue 
             
             peri = cv2.arcLength(cnt, True)
             if peri > 0:
                 circularity = 4.0 * np.pi * area / (peri**2)
-                # 切り離し跡によるギザギザを考慮し、円形度を 0.65 -> 0.45 に緩和
-                if circularity >= 0.45: 
+                if circularity >= 0.60: 
                     hull = cv2.convexHull(cnt)
                     hull_area = cv2.contourArea(hull)
                     if hull_area > 0:
                         solidity = area / float(hull_area)
-                        # 同様に凸包率も 0.85 -> 0.75 に緩和
-                        if solidity >= 0.75:
+                        if solidity >= 0.85:
                             raw_rects.append([x, y, x+w, y+h])
                             raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
-    if len(nms_boxes) == 0: return [], thick_lines_mask 
+    if len(nms_boxes) == 0: return [], thick_lines_mask
 
+    # 幹チェック（元のthresh画像を使って正確に幹の有無を調べる）
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
@@ -219,7 +194,7 @@ def get_pitch_name(note_y, staff, clef):
     if clef == "treble":
         mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
     else:
-        mapping = {-6:"ラ",-5:"シ",-4:"ド",-3:"レ",-2:"ミ",-1:"ファ",0:"ソ",1:"ラ",2:"シ",3:"ド",4:"レ",5:"ミ",6:"ファ",7:"ソ",8:"ラ",9:"シ",10:"ド",11:"レ",12:"ミ",13:"ファ",14:"ソ",15:"ラ",16:"シ"}
+        mapping = {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}
     return mapping.get(steps, "")
 
 # ==========================================
@@ -228,12 +203,13 @@ def get_pitch_name(note_y, staff, clef):
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None, beams_mask=None):
     result = pil_img.copy().convert("RGBA")
     
+    # 🛑【Code 2の統合】デバッグ用：除外された太い直線をマゼンタで表示
     if beams_mask is not None and not hide_boxes:
-        color_layer = Image.new("RGBA", result.size, (255, 0, 255, 128)) 
+        color_layer = Image.new("RGBA", result.size, (255, 0, 255, 80))
         mask_img = Image.fromarray(beams_mask).convert("L")
         result.paste(color_layer, (0, 0), mask=mask_img)
 
-    result = result.convert("RGB") 
+    result = result.convert("RGB")
     draw = ImageDraw.Draw(result)
     
     font_size = max(15, int(space))
@@ -243,7 +219,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         font = ImageFont.load_default()
 
     drawn_text_rects = []
-
     active_notes = []
     for box in auto_notes:
         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
@@ -303,12 +278,12 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
             group_avg_x = sum(n["x"] for n in group) / len(group)
             
             combined_text = " ".join(labels_to_draw)
-            
             text_x = group_avg_x - int(space * 0.6)
             text_y = min_y - int(space * 1.6)
             text_w = len(combined_text) * font_size
             text_h = font_size
             
+            # Code 1の高度なテキスト重複回避ロジック
             while True:
                 is_overlapping = False
                 for (rx, ry, rw, rh) in drawn_text_rects:
@@ -338,15 +313,12 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
     data = []
     for img in imgs:
         staves, space = detect_staff_groups_v8(img)
-        if staves:
-            notes, beams_mask = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves)
-        else:
-            notes, beams_mask = [], None
+        notes, beams_mask = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else ([], None)
         data.append({"image": img, "staves": staves, "space": space, "notes": notes, "beams_mask": beams_mask})
     return data
 
 # ==========================================
-# 3. Streamlit UI
+# 3. Streamlit UI (Code 1の高度なUIを踏襲)
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 
@@ -356,12 +328,12 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 100
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
 
-st.title("🎼 ドレミ付与ツール V8")
+st.title("🎼 ドレミ付与ツール V8 (統合版)")
 
 steps = ["1. アップロード", "2. ワンクリック調整", "3. マニュアル微調整", "4. プレビュー＆保存"]
 cols = st.columns(4)
@@ -373,7 +345,7 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.85 - (100 / 100.0) * 0.40
+internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
@@ -397,10 +369,15 @@ if st.session_state.step == 2:
     img_container_col, slider_container_col = st.columns([4, 1]) 
 
     with slider_container_col:
+        st.write("### ") 
+        st.subheader("⚙️ 調整設定")
+        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
+        st.divider()
         st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
             st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
+        st.info("🟣 マゼンタ色の表示は、AIが「音符ではない（連桁・縦線）」と認識して除外したエリアです。")
 
     with img_container_col:
         for i, page in enumerate(pages):
@@ -419,7 +396,7 @@ if st.session_state.step == 2:
                 res_img = draw_all_notes(
                     page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
                     st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key],
-                    beams_mask=page["beams_mask"]
+                    beams_mask=page.get("beams_mask")
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
@@ -495,7 +472,7 @@ if st.session_state.step == 3:
 
             res_img = draw_all_notes(
                 page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
-                custom_labels_page, selected_pos=sel_pos, beams_mask=page["beams_mask"]
+                custom_labels_page, selected_pos=sel_pos, beams_mask=page.get("beams_mask")
             )
             value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
             
@@ -536,20 +513,20 @@ if st.session_state.step == 3:
                 st.session_state.selected_note = {"page": i, "x": found_note[0], "y": found_note[1], "label": current_label}
                 st.rerun()
 
-        if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
-            sel = st.session_state.selected_note
-            new_label = st.text_input(f"✎ 選択中の音符のテキスト（ページ {i+1}）", value=sel["label"], key=f"input_{i}")
-            if new_label != sel["label"]:
-                custom_labels_page[(sel["x"], sel["y"])] = new_label
-                st.session_state.selected_note["label"] = new_label
-                st.rerun()
+            if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
+                sel = st.session_state.selected_note
+                new_label = st.text_input(f"✎ 選択中の音符のテキスト（ページ {i+1}）", value=sel["label"], key=f"input_{i}")
+                if new_label != sel["label"]:
+                    custom_labels_page[(sel["x"], sel["y"])] = new_label
+                    st.session_state.selected_note["label"] = new_label
+                    st.rerun()
         else:
             st.image(page["image"], width=FIXED_DISP_WIDTH)
 
 if st.session_state.step == 4:
     st.subheader("Step 4: 完成プレビュー＆ダウンロード")
     col1, col2 = st.columns([1, 1])
-    col1.info("✅ 枠線が消え、テキストのみが描画された完成版です。")
+    col1.info("✅ 枠線やマゼンタ色エリアが消え、テキストのみが描画された完成版です。")
     col2.button("⬅️ 戻る (Step 3へ)", on_click=prev_step)
     
     out_images = []
@@ -559,8 +536,7 @@ if st.session_state.step == 4:
             res_img = draw_all_notes(
                 page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), 
                 st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], 
-                st.session_state.custom_labels.get(i, {}), hide_boxes=True,
-                beams_mask=page["beams_mask"] 
+                st.session_state.custom_labels.get(i, {}), hide_boxes=True, beams_mask=page.get("beams_mask")
             )
             out_images.append(res_img)
             st.image(res_img, width=FIXED_DISP_WIDTH)
