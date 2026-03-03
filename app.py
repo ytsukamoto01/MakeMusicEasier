@@ -346,9 +346,6 @@ st.divider()
 FIXED_DISP_WIDTH = 800 
 internal_threshold = 0.85 - (100 / 100.0) * 0.40
 
-st.write(st.session_state.ui_sens)
-st.write(internal_threshold)
-
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
 else:
