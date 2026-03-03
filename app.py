@@ -69,7 +69,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 🛑【統合機能】太い線（連桁や太い縦線）を感知してマスクを作成
+    # 【統合機能】太い線（連桁や太い縦線）を感知してマスクを作成 (変更なし)
     beam_w = int(staff_space * 1.5)
     beam_h = max(2, int(staff_space * 0.25)) 
     beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
@@ -80,22 +80,31 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     v_beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (v_beam_w, v_beam_h))
     thick_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_beam_k)
 
-    # このマスク（白部分）に該当する場所は、後で検知をキャンセルする
     thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
+
+    # 🛑【修正点1】2つ目のコードの本来のアプローチを採用
+    # 元の thresh から太い線のマスクを「引き算（減算）」します。
+    # これにより、ピンク色（マスク）の部分は画像から完全に消滅します。
+    thresh_for_notes = cv2.subtract(thresh, thick_lines_mask)
 
     # 既存の高精度な音符の形状抽出プロセス
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
-    notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
+    # notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k) # 元
+    # 🛑【修正点2】減算後の thresh_for_notes に対して処理を行います
+    notes_only = cv2.morphologyEx(thresh_for_notes, cv2.MORPH_OPEN, open_k) 
+
     close_k_size = max(3, int(staff_space * 0.3))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
+    # (以下、テンプレートマッチング res 作成、centroids まで変更なし)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
 
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
     template = np.zeros((nh, nw), dtype=np.uint8)
     cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
+    # filled (減算・モルフォロジー後) に対してテンプレートマッチングを行う
     res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
     loc = np.where(res >= threshold_val)
 
@@ -107,25 +116,28 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         cx, cy = x + w//2, y + h//2
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         
-        # 基本の除外判定
-        if dist_to_nearest_staff > staff_space * 4.0: continue
+        # 基本の除外判定 (StaffSpace*4.0 -> *3.0 へ少し厳しく調整)
+        if dist_to_nearest_staff > staff_space * 3.0: continue
+        
+        # labels.shape のチェックは必要
         if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
         
-        # 🛑【統合機能】中心座標が太い線（連桁や縦線）のマスク上にある場合は感知をキャンセル！
-        if thick_lines_mask[cy, cx] > 0: 
-            continue
+        # 🛑【修正点3】前のコードで行っていた除外判定を削除します。
+        # 画像から物理的に引いたので、ここで判定する必要はありません。
+        # if thick_lines_mask[cy, cx] > 0: 
+        #     continue
         
+        # (以下、形状判定は変更なし)
         label = labels[cy, cx]
         if label == 0: continue # 背景
         
+        # connectedComponents の統計情報 (減算後の filled に対して作られている)
         comp_w = stats[label, cv2.CC_STAT_WIDTH]
         comp_h = stats[label, cv2.CC_STAT_HEIGHT]
         
-        # 塊の幅が広すぎる・高すぎる場合の除外
         if comp_w > staff_space * 3.5: continue
         if comp_h > staff_space * 5.5: continue
 
-        # 形状（円形度など）の厳密なチェック
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
