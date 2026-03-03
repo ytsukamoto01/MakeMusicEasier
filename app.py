@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (統合版)
+# 1. 楽譜解析エンジン (統合修正版)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -69,7 +69,8 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 🛑【Code 2の統合】太い線（連桁や太い縦線）の感知と除外
+    # 🛑【Code 2の統合】太い線（連桁や太い縦線）の検知
+    # ※ここでは画像から引き算せず、「除外用マスク」として持っておく
     beam_w = int(staff_space * 1.5)
     beam_h = max(2, int(staff_space * 0.25)) 
     beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
@@ -80,14 +81,12 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     v_beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (v_beam_w, v_beam_h))
     thick_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_beam_k)
 
-    # 太い直線のマスクを作成し、元の画像から引き算する
     thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
-    thresh_for_notes = cv2.subtract(thresh, thick_lines_mask)
 
-    # 🛑【Code 1の統合】精密な形状解析による音符判定
+    # 🛑【Code 1のロジック完全復旧】元の thresh 画像を使って正確な形状認識を行う
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
-    notes_only = cv2.morphologyEx(thresh_for_notes, cv2.MORPH_OPEN, open_k) # 線を除去した画像にかける
+    notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k) 
     
     close_k_size = max(3, int(staff_space * 0.3))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
@@ -111,6 +110,14 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         if dist_to_nearest_staff > staff_space * 4.0: continue
         
         if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        
+        # 🛑【追加フィルター】見つけた四角が「太い線」の上に乗っていないかチェック
+        overlap_mask = thick_lines_mask[y:y+h, x:x+w]
+        if overlap_mask is not None and overlap_mask.size > 0:
+            overlap_ratio = np.sum(overlap_mask > 0) / (w * h)
+            if overlap_ratio > 0.4:  # 見つけた四角の40%以上が太い線なら、それは誤検知として捨てる
+                continue
+
         label = labels[cy, cx]
         if label == 0: continue # 背景
         
@@ -153,7 +160,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     
     if len(nms_boxes) == 0: return [], thick_lines_mask
 
-    # 幹チェック（元のthresh画像を使って正確に幹の有無を調べる）
+    # 幹チェック
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
@@ -203,7 +210,6 @@ def get_pitch_name(note_y, staff, clef):
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None, beams_mask=None):
     result = pil_img.copy().convert("RGBA")
     
-    # 🛑【Code 2の統合】デバッグ用：除外された太い直線をマゼンタで表示
     if beams_mask is not None and not hide_boxes:
         color_layer = Image.new("RGBA", result.size, (255, 0, 255, 80))
         mask_img = Image.fromarray(beams_mask).convert("L")
@@ -283,7 +289,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
             text_w = len(combined_text) * font_size
             text_h = font_size
             
-            # Code 1の高度なテキスト重複回避ロジック
             while True:
                 is_overlapping = False
                 for (rx, ry, rw, rh) in drawn_text_rects:
@@ -318,7 +323,7 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
     return data
 
 # ==========================================
-# 3. Streamlit UI (Code 1の高度なUIを踏襲)
+# 3. Streamlit UI
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 
@@ -333,7 +338,7 @@ if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
 
-st.title("🎼 ドレミ付与ツール V8 (統合版)")
+st.title("🎼 ドレミ付与ツール V8 (完全統合版)")
 
 steps = ["1. アップロード", "2. ワンクリック調整", "3. マニュアル微調整", "4. プレビュー＆保存"]
 cols = st.columns(4)
