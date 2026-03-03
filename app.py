@@ -8,238 +8,205 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 高精度楽譜解析エンジン (V9)
+# 1. 楽譜解析エンジン (V8 ロジック + 連桁サイズ除外方式)
 # ==========================================
-def detect_staff_lines_hough(gray_img):
-    """Hough変換で5線を高精度検出"""
-    edges = cv2.Canny(gray_img, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=gray_img.shape[1]*0.7, maxLineGap=10)
+def detect_staff_groups_v8(pil_img):
+    img_array = np.array(pil_img.convert('L'))
+    _, thresh = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    projection = np.sum(thresh, axis=1)
     
-    if lines is None:
-        return []
-    
-    # 水平線のみ抽出（角度±5度以内）
-    horizontal_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = np.arctan2(y2-y1, x2-x1) * 180 / np.pi
-        if abs(angle) < 5:  # ほぼ水平
-            horizontal_lines.append((min(y1,y2), max(y1,y2)))
-    
-    # Y座標でソート・クラスタリング
-    y_coords = sorted([y for _, y in horizontal_lines])
-    clustered = []
-    if y_coords:
-        current = [y_coords[0]]
-        for y in y_coords[1:]:
-            if y - current[-1] < 20:  # 近接ピクセルは同一線
-                current[-1] = (current[-1] + y) / 2
+    peaks = []
+    thresh_val = np.max(projection) * 0.3 
+    for i in range(1, len(projection) - 1):
+        if projection[i] > thresh_val and projection[i] >= projection[i-1] and projection[i] >= projection[i+1]:
+            peaks.append(i)
+
+    merged = []
+    if peaks:
+        curr = peaks[0]
+        for i in range(1, len(peaks)):
+            if peaks[i] - curr < 5: 
+                curr = (curr + peaks[i]) // 2
             else:
-                clustered.append(current[-1])
-                current = [y]
-        clustered.append(current[-1])
-    
-    # 5本の線が等間隔か判定
-    if len(clustered) >= 5:
-        diffs = np.diff(clustered[:5])
-        avg_space = np.mean(diffs)
-        if np.all(np.abs(diffs - avg_space) < avg_space * 0.4):
-            return clustered[:5], avg_space
-    return [], 12
+                merged.append(curr)
+                curr = peaks[i]
+        merged.append(curr)
 
-def detect_staff_groups_v9(pil_img):
-    """改良版5線譜グループ検出"""
-    gray = np.array(pil_img.convert('L'))
-    
-    # 複数スケールで5線検出
-    staves1, space1 = detect_staff_lines_hough(gray)
-    if not staves1:
-        # フォールバック：投影法
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        proj = np.sum(thresh, axis=1)
-        peaks = []
-        thresh_val = np.max(proj) * 0.25
-        for i in range(2, len(proj)-2):
-            if proj[i] > thresh_val and proj[i] > max(proj[i-2:i]) and proj[i] > max(proj[i+1:i+3]):
-                peaks.append(i)
-        
-        if len(peaks) >= 5:
-            staves1, space1 = peaks[:5], np.mean(np.diff(peaks[:5]))
-    
-    # 縦方向のスタッフグループ化
-    all_staves = []
-    staff_height = int(space1 * 5 * 1.2)
-    for i in range(gray.shape[0] - staff_height):
-        window_lines = [line for line in staves1 if i <= line <= i + staff_height]
-        if len(window_lines) >= 5:
-            all_staves.append(sorted(window_lines[:5], reverse=True))
-    
-    # 重複除去
-    unique_staves = []
-    for staff in all_staves:
-        if not any(np.all(np.abs(np.array(staff) - np.array(s)) < space1*0.5) for s in unique_staves):
-            unique_staves.append(staff)
-    
-    return unique_staves, space1 if unique_staves else 12
+    staves = []
+    i = 0
+    avg_spacing = 10
+    while i <= len(merged) - 5:
+        segment = merged[i:i+5]
+        diffs = np.diff(segment)
+        avg_spacing = np.mean(diffs)
+        if np.all(np.abs(diffs - avg_spacing) < avg_spacing * 0.45):
+            staves.append(sorted(segment, reverse=True))
+            i += 5
+        else:
+            i += 1
+    return staves, avg_spacing if staves else 10
 
-def remove_staff_lines_and_noise(gray_img, staves, staff_space):
-    """5線・ノイズを徹底除去"""
-    h, w = gray_img.shape
-    mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # 5線をマスク
-    for staff in staves:
-        for line_y in staff:
-            y1 = max(0, int(line_y - staff_space * 0.15))
-            y2 = min(h, int(line_y + staff_space * 0.15))
-            mask[y1:y2, :] = 255
-    
-    # 細いノイズを除去
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    cleaned = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel_small, iterations=1)
-    
-    # 連桁・太い線を追加除去
-    thick_h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(staff_space*3), 3))
-    thick_v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, int(staff_space*2)))
-    thick_lines = cv2.morphologyEx(gray_img, cv2.MORPH_OPEN, thick_h_kernel)
-    thick_lines = cv2.bitwise_or(thick_lines, cv2.morphologyEx(gray_img, cv2.MORPH_OPEN, thick_v_kernel))
-    cleaned = cv2.bitwise_or(cleaned, thick_lines)
-    
-    return cleaned
+def nms_v8_strict(boxes, scores, staff_space):
+    if len(boxes) == 0:
+        return []
+    idxs = np.argsort(scores)[::-1]
+    pick = []
+    while len(idxs) > 0:
+        i = idxs[0]
+        pick.append(i)
+        c_x = (boxes[i, 0] + boxes[i, 2]) / 2
+        remaining = idxs[1:]
+        if len(remaining) == 0:
+            break
+        o_x = (boxes[remaining, 0] + boxes[remaining, 2]) / 2
+        o_y = (boxes[remaining, 1] + boxes[remaining, 3]) / 2
+        dist = np.sqrt((c_x - o_x)**2 + ((boxes[i, 1] + boxes[i, 3])/2 - o_y)**2)
+        duplicate = (dist < staff_space * 0.7)
+        idxs = np.delete(remaining, np.where(duplicate)[0])
+    return boxes[pick].astype("int")
 
-def detect_note_heads_v9(gray_img, staff_space, threshold_val=0.75, staves=None):
-    """高精度符頭検出"""
-    # 適応閾値で二値化
-    thresh = cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                  cv2.THRESH_BINARY_INV, 21, 12)
+def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
+    blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # 5線・ノイズ除去
-    if staves:
-        noise_mask = remove_staff_lines_and_noise(thresh, staves, staff_space)
-    else:
-        noise_mask = thresh
+    # ===== [NEW STRATEGY] 符幹を切断し、分離した連桁をサイズで捨てる =====
+    # 1. 細い線（符幹）だけを消去し、音符と連桁を孤立させる
+    sever_k_size = max(2, int(staff_space * 0.35))
+    sever_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size))
+    severed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, sever_k)
     
-    # 符頭サイズの楕円テンプレート（複数サイズ）
-    templates = []
-    sizes = [0.7, 0.9, 1.1]
-    for scale in sizes:
-        nw = int(staff_space * scale)
-        nh = int(staff_space * scale * 0.8)
-        temp = np.zeros((nh, nw), dtype=np.uint8)
-        cv2.ellipse(temp, (nw//2, nh//2), (nw//2-1, nh//2-1), 0, 0, 360, 255, -1)
-        templates.append(temp)
+    # 2. 塊ごとにサイズを測り、横長の連桁などを除外
+    num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(severed, connectivity=8)
+    notes_only = np.zeros_like(thresh)
     
-    # 複数テンプレートでマッチング
-    matches = []
-    for temp in templates:
-        res = cv2.matchTemplate(noise_mask, temp, cv2.TM_CCOEFF_NORMED)
-        loc = np.where(res >= threshold_val)
-        for pt in zip(*loc[::-1]):
-            matches.append((pt[0] + temp.shape[1]//2, pt[1] + temp.shape[0]//2, res[pt[1], pt[0]]))
-    
-    # NMS + 形状フィルタ
-    if not matches:
-        return np.array([])
-    
-    boxes = []
-    for cx, cy, score in matches:
-        # ROI抽出
-        roi_size = int(staff_space * 1.5)
-        x1, y1 = max(0, cx-roi_size//2), max(0, cy-roi_size//2)
-        x2, y2 = min(gray_img.shape[1], cx+roi_size//2), min(gray_img.shape[0], cy+roi_size//2)
-        roi = noise_mask[y1:y2, x1:x2]
+    for label in range(1, num_labels):
+        w = stats_sev[label, cv2.CC_STAT_WIDTH]
+        h = stats_sev[label, cv2.CC_STAT_HEIGHT]
+        area = stats_sev[label, cv2.CC_STAT_AREA]
         
-        if roi.size == 0:
-            continue
-            
-        # 輪郭解析
-        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-            
-        cnt = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(cnt)
+        # 音符の幅を大きく超える横長のもの（斜線・横線の連桁）を除外
+        if w > staff_space * 3.5: continue
+        # 極端に縦長のものも除外
+        if h > staff_space * 5.0: continue
+        # 面積が大きすぎる、小さすぎるものを除外
+        if area > staff_space**2 * 4.0: continue
+        if area < staff_space**2 * 0.3: continue
         
-        # 厳格な形状フィルタ
-        if area < (staff_space**2 * 0.25) or area > (staff_space**2 * 2.5):
-            continue
-            
-        rect = cv2.minAreaRect(cnt)
-        (rw, rh), angle = rect[1], rect[2]
-        aspect = max(rw, rh) / min(rw, rh)
+        notes_only[labels_sev == label] = 255
         
-        peri = cv2.arcLength(cnt, True)
-        circularity = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
-        hull = cv2.convexHull(cnt)
-        solidity = area / cv2.contourArea(hull) if cv2.contourArea(hull) > 0 else 0
-        
-        # 符頭の厳格条件
-        if (0.6 <= circularity <= 0.95 and 
-            0.8 <= solidity <= 0.98 and 
-            0.6 <= aspect <= 2.0):
-            
-            boxes.append([cx-staff_space//3, cy-staff_space//3, 
-                         cx+staff_space//3, cy+staff_space//3])
-    
-    # スタッフ範囲外を除外
-    if staves:
-        staff_centers = [np.mean(s) for s in staves]
-        final_boxes = []
-        for box in boxes:
-            cy = (box[1] + box[3]) / 2
-            if min(abs(cy - c) for c in staff_centers) < staff_space * 4:
-                final_boxes.append(box)
-        boxes = final_boxes
-    
-    return np.array(boxes) if boxes else np.array([])
+    # 3. 切断によって音符にできた「欠け」を塞いで綺麗な楕円に戻す
+    close_k_size = max(2, int(staff_space * 0.4))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
+    filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
+    # =========================================================================
 
-def has_stem_v9(thresh, box, staff_space):
-    """改良版幹検出（方向性考慮）"""
-    x1, y1, x2, y2 = box.astype(int)
-    w, h = x2 - x1, y2 - y1
-    cx = (x1 + x2) // 2
+    # きれいにした画像で Connected Components を再取得
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
+
+    nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
+    template = np.zeros((nh, nw), dtype=np.uint8)
+    cv2.ellipse(template, (nw // 2, nh // 2), (nw // 2 - 1, nh // 2 - 1), -20, 0, 360, 255, -1)
+    res = cv2.matchTemplate(filled, template, cv2.TM_CCOEFF_NORMED)
+    loc = np.where(res >= threshold_val)
+
+    staff_centers = [np.mean(s) for s in staves]
+    raw_rects, raw_scores = [], []
+    for (x, y) in zip(*loc[::-1]):
+        w, h = nw, nh
+        score = res[y, x]
+        cx, cy = x + w//2, y + h//2
+        
+        dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
+        if dist_to_nearest_staff > staff_space * 4.0: continue
+        
+        if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        label = labels[cy, cx]
+        if label == 0: continue
+        
+        comp_w = stats[label, cv2.CC_STAT_WIDTH]
+        comp_h = stats[label, cv2.CC_STAT_HEIGHT]
+        comp_area = stats[label, cv2.CC_STAT_AREA]
+        
+        if comp_w > staff_space * 3.5: continue
+        if comp_h > staff_space * 5.5: continue
+        if comp_area > staff_space ** 2 * 3.0: continue
+
+        patch = filled[y:y+h, x:x+w]
+        contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cnt = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(cnt)
+            
+            if area < (staff_space**2) * 0.3: continue
+            
+            rect = cv2.minAreaRect(cnt)
+            (rw, rh) = rect[1]
+            if rw == 0 or rh == 0: continue
+            
+            rotated_aspect = max(rw, rh) / min(rw, rh)
+            if rotated_aspect > 2.0: continue 
+            
+            rotated_extent = area / (rw * rh)
+            if rotated_extent > 0.85: continue 
+            
+            peri = cv2.arcLength(cnt, True)
+            if peri > 0:
+                circularity = 4.0 * np.pi * area / (peri**2)
+                if circularity >= 0.65: 
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    if hull_area > 0:
+                        solidity = area / float(hull_area)
+                        if solidity >= 0.85:
+                            raw_rects.append([x, y, x+w, y+h])
+                            raw_scores.append(score)
     
-    # 細長い縦線検出用カーネル
-    stem_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, w//4), max(3, int(staff_space*0.8))))
+    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
-    # 上方向チェック
-    stem_up = thresh[max(0, y1-int(staff_space*2)):y1, max(0, cx-w//6):min(thresh.shape[1], cx+w//6)]
-    if stem_up.size > 0:
-        stem_up_clean = cv2.morphologyEx(stem_up, cv2.MORPH_OPEN, stem_kernel)
-        if np.sum(stem_up_clean) > stem_up.size * 0.1:
-            return True
-    
-    # 下方向チェック
-    stem_down = thresh[y2:min(thresh.shape[0], y2+int(staff_space*2)), max(0, cx-w//6):min(thresh.shape[1], cx+w//6)]
-    if stem_down.size > 0:
-        stem_down_clean = cv2.morphologyEx(stem_down, cv2.MORPH_OPEN, stem_kernel)
-        if np.sum(stem_down_clean) > stem_down.size * 0.1:
-            return True
-    
-    return False
+    if len(nms_boxes) == 0: return []
+
+    final_boxes = []
+    stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
+    stem_check_h = int(staff_space * 1.5)
+    stem_check_w_ratio = 0.3 
+
+    for box in nms_boxes:
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        cx = (x1 + x2) // 2
+        
+        stem_up_x1 = max(0, cx - int(w * stem_check_w_ratio / 2))
+        stem_up_x2 = min(thresh.shape[1], cx + int(w * stem_check_w_ratio / 2))
+        stem_up_y1 = max(0, y1 - stem_check_h)
+        stem_up_y2 = y1
+        
+        stem_down_x1 = stem_up_x1
+        stem_down_x2 = stem_up_x2
+        stem_down_y1 = y2
+        stem_down_y2 = min(thresh.shape[0], y2 + stem_check_h)
+        
+        has_stem = False
+        if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
+            opened_up = cv2.morphologyEx(thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2], cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_up) > 0: has_stem = True
+                
+        if stem_down_y2 > stem_down_y1 and stem_down_x2 > stem_down_x1:
+            opened_down = cv2.morphologyEx(thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2], cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_down) > 0: has_stem = True
+                
+        if has_stem: final_boxes.append(box)
+
+    return np.array(final_boxes) if final_boxes else []
 
 def get_pitch_name(note_y, staff, clef):
-    """音名取得（改良版）"""
-    line_positions = staff  # 上から line1, line2, line3, line4, line5
-    space_positions = []
-    for i in range(4):
-        space_positions.append((line_positions[i] + line_positions[i+1]) / 2)
-    
-    all_positions = line_positions + space_positions
-    all_positions.sort()
-    
-    # 最も近い線/間を特定
-    distances = [abs(note_y - pos) for pos in all_positions]
-    closest_idx = np.argmin(distances)
-    
+    line1, line5 = staff[0], staff[4]
+    step_size = abs(line1 - line5) / 8.0
+    steps = int(round((line1 - note_y) / step_size))
     if clef == "treble":
-        names = ["ファ", "ミ", "レ", "ド", "シ", "ラ", "ソ", "ファ", "ミ", "レ", "ド", "シ", "ラ", "ソ"]
-    else:  # bass
-        names = ["シ", "ラ", "ソ", "ファ", "ミ", "レ", "ド", "シ", "ラ", "ソ", "ファ", "ミ", "レ", "ド"]
-    
-    if closest_idx < len(names):
-        return names[closest_idx]
-    return ""
+        mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
+    else:
+        mapping = {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}
+    return mapping.get(steps, "")
 
 # ==========================================
 # 2. 描画・キャッシュ処理 
