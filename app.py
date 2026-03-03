@@ -69,13 +69,11 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # ===== [NEW STRATEGY] 符幹を切断し、分離した連桁をサイズで捨てる =====
-    # 1. 細い線（符幹）だけを消去し、音符と連桁を孤立させる
+    # 符幹を切断し、分離した連桁をサイズで捨てる
     sever_k_size = max(2, int(staff_space * 0.35))
     sever_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sever_k_size, sever_k_size))
     severed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, sever_k)
     
-    # 2. 塊ごとにサイズを測り、横長の連桁などを除外
     num_labels, labels_sev, stats_sev, _ = cv2.connectedComponentsWithStats(severed, connectivity=8)
     notes_only = np.zeros_like(thresh)
     
@@ -84,23 +82,18 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         h = stats_sev[label, cv2.CC_STAT_HEIGHT]
         area = stats_sev[label, cv2.CC_STAT_AREA]
         
-        # 音符の幅を大きく超える横長のもの（斜線・横線の連桁）を除外
-        if w > staff_space * 3.5: continue
-        # 極端に縦長のものも除外
+        # [微調整] 音符の幅を大きく超える横長のもの（斜線・横線の連桁）を除外する条件を強化 (3.5 -> 2.5)
+        if w > staff_space * 2.5: continue
         if h > staff_space * 5.0: continue
-        # 面積が大きすぎる、小さすぎるものを除外
         if area > staff_space**2 * 4.0: continue
         if area < staff_space**2 * 0.3: continue
         
         notes_only[labels_sev == label] = 255
         
-    # 3. 切断によって音符にできた「欠け」を塞いで綺麗な楕円に戻す
     close_k_size = max(2, int(staff_space * 0.4))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
-    # =========================================================================
 
-    # きれいにした画像で Connected Components を再取得
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
 
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
@@ -198,6 +191,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
 
     return np.array(final_boxes) if final_boxes else []
 
+# ===== [修正箇所] ヘ音記号の音階マッピングを修正 =====
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
     step_size = abs(line1 - line5) / 8.0
@@ -205,7 +199,8 @@ def get_pitch_name(note_y, staff, clef):
     if clef == "treble":
         mapping = {-4:"ラ",-3:"シ",-2:"ド",-1:"レ",0:"ミ",1:"ファ",2:"ソ",3:"ラ",4:"シ",5:"ド",6:"レ",7:"ミ",8:"ファ",9:"ソ",10:"ラ",11:"シ",12:"ド",13:"レ",14:"ミ",15:"ファ",16:"ソ"}
     else:
-        mapping = {-6:"ド",-5:"レ",-4:"ミ",-3:"ファ",-2:"ソ",-1:"ラ",0:"シ",1:"ド",2:"レ",3:"ミ",4:"ファ",5:"ソ",6:"ラ",7:"シ",8:"ド",9:"レ",10:"ミ",11:"ファ",12:"ソ",13:"ラ",14:"シ"}
+        # 以前は一番下の線が「シ」になっていたため、正しい「ソ」に修正しました
+        mapping = {-6:"ラ",-5:"シ",-4:"ド",-3:"レ",-2:"ミ",-1:"ファ",0:"ソ",1:"ラ",2:"シ",3:"ド",4:"レ",5:"ミ",6:"ファ",7:"ソ",8:"ラ",9:"シ",10:"ド",11:"レ",12:"ミ",13:"ファ",14:"ソ",15:"ラ",16:"シ"}
     return mapping.get(steps, "")
 
 # ==========================================
