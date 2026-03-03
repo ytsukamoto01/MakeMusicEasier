@@ -1,4 +1,4 @@
-あれ、音符が感知されていませんよ。もう一度最初のコードを貼りますねimport streamlit as st
+import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
