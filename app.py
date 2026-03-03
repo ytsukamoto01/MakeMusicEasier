@@ -68,6 +68,9 @@ def nms_v8_strict(boxes, scores, staff_space):
 def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 【追加】五線除去前の二値化画像 (thresh) を符幹チェック用に保持
+
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
@@ -91,7 +94,9 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         if dist_to_nearest_staff > staff_space * 4.0: continue
         aspect = w / float(h)
         if not (0.8 <= aspect <= 2.2): continue
-        if not ((staff_space**2)*0.3 < w*h < (staff_space**2)*3.5): continue
+        
+        # 【微調整】ヘ音記号の点を弾くため、面積フィルタの下限を少し上げる (0.3 -> 0.4)
+        if not ((staff_space**2)*0.4 < w*h < (staff_space**2)*3.5): continue
         
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -103,7 +108,62 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
                 raw_rects.append([x, y, x+w, y+h])
                 raw_scores.append(score)
     
-    return nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
+    # NMS適用
+    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
+    
+    # 🛑【修正箇所】音部記号誤検出回避フィルタ（符幹の存在確認）
+    if len(nms_boxes) == 0:
+        return []
+
+    final_boxes = []
+    
+    # 符幹チェック用の垂直構造要素（五線の間隔の半分程度の長さの垂直線を探す）
+    stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
+    # チェックする上下の長さ、幅の割合
+    stem_check_h = int(staff_space * 1.5)
+    stem_check_w_ratio = 0.3 # 符頭幅の中心付近30%のみをチェック
+
+    for box in nms_boxes:
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        cx = (x1 + x2) // 2
+        
+        # 符幹チェック領域 (上側)
+        stem_up_x1 = max(0, cx - int(w * stem_check_w_ratio / 2))
+        stem_up_x2 = min(thresh.shape[1], cx + int(w * stem_check_w_ratio / 2))
+        stem_up_y1 = max(0, y1 - stem_check_h)
+        stem_up_y2 = y1
+        
+        # 符幹チェック領域 (下側)
+        stem_down_x1 = stem_up_x1
+        stem_down_x2 = stem_up_x2
+        stem_down_y1 = y2
+        stem_down_y2 = min(thresh.shape[0], y2 + stem_check_h)
+        
+        has_stem_up = False
+        has_stem_down = False
+        
+        # 上側の垂直成分チェック
+        if stem_up_y2 > stem_up_y1 and stem_up_x2 > stem_up_x1:
+            patch_up = thresh[stem_up_y1:stem_up_y2, stem_up_x1:stem_up_x2]
+            # 垂直オープニング処理：垂直な線だけを残す
+            opened_up = cv2.morphologyEx(patch_up, cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_up) > 0: # 垂直な成分が残れば符幹ありとみなす
+                has_stem_up = True
+                
+        # 下側の垂直成分チェック
+        if stem_down_y2 > stem_down_y1 and stem_down_x2 > stem_down_x1:
+            patch_down = thresh[stem_down_y1:stem_down_y2, stem_down_x1:stem_down_x2]
+            opened_down = cv2.morphologyEx(patch_down, cv2.MORPH_OPEN, stem_k)
+            if np.sum(opened_down) > 0:
+                has_stem_down = True
+                
+        # 上か下に符幹があれば音符として採用
+        # ト音記号やヘ音記号のノイズは、上下両方に垂直成分がないため除外されます
+        if has_stem_up or has_stem_down:
+            final_boxes.append(box)
+
+    return np.array(final_boxes) if final_boxes else []
 
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
@@ -203,7 +263,8 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 100 # スライダーの初期値
+# 感度スライダーの初期値をセッションステートに保持
+if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -221,10 +282,11 @@ st.divider()
 
 # 表示サイズは内部で 800px に固定します
 FIXED_DISP_WIDTH = 800 
-# スライダーの値を元に検出閾値を計算
+
+# スライダーの値を元に検出閾値を計算 (スライダーはStep2で表示しますが、計算は常に行います)
 internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
-# PDFの処理（キャッシュ化されているので閾値が変わった時だけ再計算されます）
+# PDFの処理（キャッシュ化されているので感度や閾値が変わった時だけ再計算されます）
 if st.session_state.pdf_data:
     pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
 else:
@@ -246,55 +308,93 @@ if st.session_state.step == 1:
 # STEP 2: ワンクリック自動調整
 # ==========================================
 if st.session_state.step == 2:
-    col1, col2 = st.columns([1, 1])
-    col1.subheader("Step 2: ワンクリック調整")
-    col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
-    col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
+    subheader_col1, subheader_col2 = st.columns([2, 1])
+    subheader_col1.subheader("Step 2: ワンクリック調整")
+    subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
+    subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
 
-    # ★感度スライダーをここに配置
-    st.slider("🔍 自動検出の感度（ページを見ながら調整できます）", 1, 100, key="ui_sens")
-    st.info("💡 **操作:** まずスライダーで良い感じの感度に合わせます。そのあと、検出漏れの場所をクリックで追加、既存の音符の近くをクリックで削除できます。")
+    # 🛑【修正箇所】レイアウト変更（画像エリアとスライダーエリアを横並びに）
+    # 広いカラム (4) に画像、狭いカラム (1) にスライダーを配置
+    img_container_col, slider_container_col = st.columns([4, 1]) 
 
-    for i, page in enumerate(pages):
-        st.write(f"### ページ {i + 1}")
-        if page["staves"]:
-            clicks = st.session_state.custom_clicks.setdefault(i, [])
-            deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
-            
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], st.session_state.custom_labels.get(i, {}))
-            value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
-            
-            last_click_key = f"s2_last_click_{i}"
-            if last_click_key not in st.session_state: st.session_state[last_click_key] = None
-            
-            if value and value != st.session_state[last_click_key]:
-                st.session_state[last_click_key] = value
-                scale = page["image"].width / FIXED_DISP_WIDTH
-                real_x, real_y = value["x"] * scale, value["y"] * scale
-                click_threshold = page["space"] * 1.5 
-                action_taken = False
+    # --- 右カラム：固定設定エリア ---
+    with slider_container_col:
+        # スライダーが画像の上部に固定されるようにスペースを調整
+        st.write("### ") 
+        st.write("### ")
+        st.write("### ")
+        st.divider()
+        st.subheader("⚙️ 調整設定")
+        # 共通の感度スライダー (key="ui_sens"で値を保持)
+        st.slider(
+            "🔍 自動検出の感度（横のページを見ながら調整できます）", 
+            1, 100, 
+            key="ui_sens",
+            help="大きくするとより多くの音符が検出されますが、ノイズも増えます。"
+        )
+        st.info("💡 **操作説明:** まずスライダーで良い感じの感度に合わせます。そのあと、各画像の検出漏れの場所をクリックで追加、すでにある音符（枠線）の近くをクリックで削除できます。")
 
-                for pt in clicks.copy():
-                    if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
-                        clicks.remove(pt)
-                        action_taken = True
-                        break
+    # --- 左カラム：画像表示エリア ---
+    with img_container_col:
+        for i, page in enumerate(pages):
+            st.write(f"### ページ {i + 1}")
+            if page["staves"]:
+                clicks = st.session_state.custom_clicks.setdefault(i, [])
+                deleted_auto = st.session_state.deleted_auto_notes.setdefault(i, [])
+                
+                # 画像描画（枠線を表示）
+                res_img = draw_all_notes(
+                    page["image"], 
+                    page["notes"], 
+                    clicks, 
+                    deleted_auto, 
+                    page["staves"], 
+                    page["space"], 
+                    st.session_state.custom_labels.get(i, {})
+                )
+                
+                # 画像を表示してクリック座標を取得
+                value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
+                
+                # クリック処理 (無限ループ防止)
+                last_click_key = f"s2_last_click_{i}"
+                if last_click_key not in st.session_state: st.session_state[last_click_key] = None
+                
+                if value and value != st.session_state[last_click_key]:
+                    st.session_state[last_click_key] = value # 処理済みとして記録
+                    
+                    clicked_x, clicked_y = value["x"], value["y"]
+                    scale = page["image"].width / FIXED_DISP_WIDTH
+                    real_x, real_y = clicked_x * scale, clicked_y * scale
+                    
+                    click_threshold = page["space"] * 1.5 
+                    action_taken = False
 
-                if not action_taken:
-                    for box in page["notes"]:
-                        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
-                        if not any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto):
-                            if math.hypot(real_x - cx, real_y - cy) < click_threshold:
+                    # 1. まず「手動追加した音符」の近くをクリックしたかチェック（削除）
+                    for pt in clicks.copy():
+                        if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
+                            clicks.remove(pt)
+                            action_taken = True
+                            break
+
+                    # 2. 次に「自動検出された音符」の近くをクリックしたかチェック（削除）
+                    if not action_taken:
+                        for box in page["notes"]:
+                            cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                            is_already_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
+                            if not is_already_deleted and math.hypot(real_x - cx, real_y - cy) < click_threshold:
                                 deleted_auto.append((cx, cy))
                                 action_taken = True
                                 break
 
-                if not action_taken:
-                    clicks.append((real_x, real_y))
-                st.rerun() 
-        else:
-            st.warning("⚠️ このページからは五線が検出されませんでした。")
-            st.image(page["image"], width=FIXED_DISP_WIDTH)
+                    # 3. どちらの音符の近くでもなければ「新規追加」
+                    if not action_taken:
+                        clicks.append((real_x, real_y))
+                    
+                    st.rerun() # 画面を更新
+            else:
+                st.warning(f"⚠️ ページ {i+1} からは五線が検出されませんでした。")
+                st.image(page["image"], width=FIXED_DISP_WIDTH)
 
 # ==========================================
 # STEP 3: マニュアル微調整
