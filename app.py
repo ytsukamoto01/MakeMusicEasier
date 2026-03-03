@@ -69,7 +69,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # ===== [NEW] 線分検出によるマスク作成 =====
+    # ===== 線分検出によるマスク作成 =====
     # LSD (Line Segment Detector) を初期化
     lsd = cv2.createLineSegmentDetector(0)
     lines, width, prec, nfa = lsd.detect(gray_img)
@@ -112,12 +112,11 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         score = res[y, x]
         cx, cy = x + w//2, y + h//2
         
-        # ===== [NEW] 線分マスク上でこの点が有効かチェック =====
+        # 線分マスク上でこの点が有効かチェック
         if cy >= line_mask.shape[0] or cx >= line_mask.shape[1]:
             continue
         if line_mask[cy, cx] == 0:   # 線分領域内なら除外
             continue
-        # ==================================================
         
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
@@ -315,7 +314,9 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
     return result
 
 @st.cache_data(show_spinner=False)
-def process_pdf_and_detect(pdf_bytes, internal_threshold):
+def process_pdf_and_detect(pdf_bytes):
+    # 検出閾値は固定値 0.45（スライダー最大時）
+    internal_threshold = 0.45
     imgs = convert_from_bytes(pdf_bytes)
     data = []
     for img in imgs:
@@ -335,7 +336,6 @@ if "deleted_auto_notes" not in st.session_state: st.session_state.deleted_auto_n
 if "custom_labels" not in st.session_state: st.session_state.custom_labels = {} 
 if "selected_note" not in st.session_state: st.session_state.selected_note = None 
 if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
-if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50 
 
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
@@ -352,10 +352,9 @@ for i, step_name in enumerate(steps):
 st.divider()
 
 FIXED_DISP_WIDTH = 800 
-internal_threshold = 0.85 - (st.session_state.ui_sens / 100.0) * 0.40
 
 if st.session_state.pdf_data:
-    pages = process_pdf_and_detect(st.session_state.pdf_data, internal_threshold)
+    pages = process_pdf_and_detect(st.session_state.pdf_data)
 else:
     pages = []
 
@@ -369,16 +368,15 @@ if st.session_state.step == 1:
 
 if st.session_state.step == 2:
     subheader_col1, subheader_col2 = st.columns([2, 1])
-    subheader_col1.subheader("Step 2: 自動検出の調整")
+    subheader_col1.subheader("Step 2: ワンクリック調整")
     subheader_col2.button("次へ：テキストの微調整 ➡️", on_click=next_step, type="primary")
     subheader_col2.button("⬅️ やり直す (Step 1へ)", on_click=prev_step)
 
-    img_container_col, slider_container_col = st.columns([4, 1]) 
+    img_container_col, info_col = st.columns([4, 1]) 
 
-    with slider_container_col:
-        st.write("### ") 
-        st.subheader("⚙️ 調整設定")
-        st.slider("🔍 検出感度", 1, 100, key="ui_sens")
+    with info_col:
+        st.write("### ")
+        st.info("🔍 検出感度は固定 (最大感度)")
         st.divider()
         st.subheader("🖱️ 操作モード")
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
