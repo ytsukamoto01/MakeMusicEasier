@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (V8 ロジック)
+# 1. 楽譜解析エンジン (V8 ロジック 合体版)
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -69,6 +69,21 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     blurred = cv2.GaussianBlur(gray_img, (3, 3), 0)
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
+    # 🛑【統合機能】太い線（連桁や太い縦線）を感知してマスクを作成
+    beam_w = int(staff_space * 1.5)
+    beam_h = max(2, int(staff_space * 0.25)) 
+    beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
+    thick_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, beam_k)
+
+    v_beam_w = max(2, int(staff_space * 0.25))
+    v_beam_h = int(staff_space * 2.5)
+    v_beam_k = cv2.getStructuringElement(cv2.MORPH_RECT, (v_beam_w, v_beam_h))
+    thick_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_beam_k)
+
+    # このマスク（白部分）に該当する場所は、後で検知をキャンセルする
+    thick_lines_mask = cv2.bitwise_or(thick_horizontal, thick_vertical)
+
+    # 既存の高精度な音符の形状抽出プロセス
     open_k_size = max(3, int(staff_space * 0.6))
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k_size, open_k_size))
     notes_only = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, open_k)
@@ -76,7 +91,6 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k_size, close_k_size))
     filled = cv2.morphologyEx(notes_only, cv2.MORPH_CLOSE, close_k)
 
-    # 🛑【追加】画像内の「黒い塊」ごとの大きさを計測する
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(filled, connectivity=8)
 
     nw, nh = int(staff_space * 1.3), int(staff_space * 1.0)
@@ -92,27 +106,31 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         score = res[y, x]
         cx, cy = x + w//2, y + h//2
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
-        if dist_to_nearest_staff > staff_space * 4.0: continue
         
-        # 🛑【追加】連桁（ビーム）や縦棒の排除ロジック
+        # 基本の除外判定
+        if dist_to_nearest_staff > staff_space * 4.0: continue
         if cy >= labels.shape[0] or cx >= labels.shape[1]: continue
+        
+        # 🛑【統合機能】中心座標が太い線（連桁や縦線）のマスク上にある場合は感知をキャンセル！
+        if thick_lines_mask[cy, cx] > 0: 
+            continue
+        
         label = labels[cy, cx]
         if label == 0: continue # 背景
         
         comp_w = stats[label, cv2.CC_STAT_WIDTH]
         comp_h = stats[label, cv2.CC_STAT_HEIGHT]
         
-        # 塊の幅が「音符3.5個分」より広い場合は、連桁（ビーム）やタイとみなして除外
+        # 塊の幅が広すぎる・高すぎる場合の除外
         if comp_w > staff_space * 3.5: continue
-        # 塊の高さが異常に高い場合は、縦の反復記号や音部記号とみなして除外
         if comp_h > staff_space * 5.5: continue
 
+        # 形状（円形度など）の厳密なチェック
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(cnt)
-            
             if area < (staff_space**2) * 0.3: continue
             
             rect = cv2.minAreaRect(cnt)
@@ -137,10 +155,13 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
                             raw_rects.append([x, y, x+w, y+h])
                             raw_scores.append(score)
     
-    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
-    
-    if len(nms_boxes) == 0: return []
+    if not raw_rects: return [], thick_lines_mask
 
+    nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space)
+    
+    if len(nms_boxes) == 0: return [], thick_lines_mask
+
+    # 幹（符幹）のチェック
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
@@ -172,7 +193,7 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
                 
         if has_stem: final_boxes.append(box)
 
-    return np.array(final_boxes) if final_boxes else []
+    return np.array(final_boxes) if final_boxes else [], thick_lines_mask
 
 def get_pitch_name(note_y, staff, clef):
     line1, line5 = staff[0], staff[4]
@@ -187,8 +208,15 @@ def get_pitch_name(note_y, staff, clef):
 # ==========================================
 # 2. 描画・キャッシュ処理 
 # ==========================================
-def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None):
-    result = pil_img.copy().convert("RGB")
+def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None, beams_mask=None):
+    # 🛑【統合機能】マゼンタの半透明マスクを乗せる処理
+    result = pil_img.copy().convert("RGBA")
+    if beams_mask is not None and not hide_boxes:
+        color_layer = Image.new("RGBA", result.size, (255, 0, 255, 128))
+        mask_img = Image.fromarray(beams_mask).convert("L")
+        result.paste(color_layer, (0, 0), mask=mask_img)
+
+    result = result.convert("RGB")
     draw = ImageDraw.Draw(result)
     
     font_size = max(15, int(space))
@@ -293,12 +321,13 @@ def process_pdf_and_detect(pdf_bytes, internal_threshold):
     data = []
     for img in imgs:
         staves, space = detect_staff_groups_v8(img)
-        notes = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else []
-        data.append({"image": img, "staves": staves, "space": space, "notes": notes})
+        # 🛑【変更】戻り値からマスクも受け取るように修正
+        notes, beams_mask = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else ([], None)
+        data.append({"image": img, "staves": staves, "space": space, "notes": notes, "beams_mask": beams_mask})
     return data
 
 # ==========================================
-# 3. Streamlit UI
+# 3. Streamlit UI (1つ目のコードの堅牢なUIを維持)
 # ==========================================
 st.set_page_config(page_title="ドレミ付与 V8", layout="wide") 
 
@@ -353,6 +382,7 @@ if st.session_state.step == 2:
         edit_mode = st.radio("画像クリック時の動作", ["👆 通常\n(追加 / 個別削除)", "🔲 範囲消去\n(2点クリックで一括削除)"])
         if "範囲消去" in edit_mode:
             st.warning("⚠️ **範囲消去モード中**\n消したいエリアの「左上」をクリックし、次に「右下」をクリックしてください。")
+        st.info("💡 マゼンタ色の部分は「連桁（れんこう）」や反復記号として自動的に検知がキャンセルされたエリアです。")
 
     with img_container_col:
         for i, page in enumerate(pages):
@@ -368,9 +398,11 @@ if st.session_state.step == 2:
                 if "範囲消去" not in edit_mode:
                     st.session_state[erase_start_key] = None
 
+                # 🛑【変更】beams_mask を渡してマゼンタ表示を有効化
                 res_img = draw_all_notes(
                     page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
-                    st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key]
+                    st.session_state.custom_labels.get(i, {}), erase_start=st.session_state[erase_start_key],
+                    beams_mask=page.get("beams_mask")
                 )
                 
                 value = streamlit_image_coordinates(res_img, key=f"s2_img_{i}", width=FIXED_DISP_WIDTH)
@@ -444,7 +476,11 @@ if st.session_state.step == 3:
             if st.session_state.selected_note and st.session_state.selected_note["page"] == i:
                 sel_pos = (st.session_state.selected_note["x"], st.session_state.selected_note["y"])
 
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], custom_labels_page, selected_pos=sel_pos)
+            # 🛑【変更】ここでも beams_mask を渡す
+            res_img = draw_all_notes(
+                page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], 
+                custom_labels_page, selected_pos=sel_pos, beams_mask=page.get("beams_mask")
+            )
             value = streamlit_image_coordinates(res_img, key=f"s3_img_{i}", width=FIXED_DISP_WIDTH)
             
             last_click_key = f"s3_last_click_{i}"
@@ -504,6 +540,7 @@ if st.session_state.step == 4:
     for i, page in enumerate(pages):
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
+            # 完成版では hide_boxes=True のため、マゼンタのハイライトは自動的に消えます
             res_img = draw_all_notes(
                 page["image"], page["notes"], st.session_state.custom_clicks.get(i, []), 
                 st.session_state.deleted_auto_notes.get(i, []), page["staves"], page["space"], 
