@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import io
+import math
 from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
@@ -118,10 +119,9 @@ def get_pitch_name(note_y, staff, clef, flats_count):
     return name, name in flat_order[:flats_count]
 
 # ==========================================
-# 2. 描画・キャッシュ処理
+# 2. 描画処理（削除リストの引数を追加）
 # ==========================================
-
-def draw_all_notes(pil_img, auto_notes, custom_clicks, staves, space, flats_count):
+def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, flats_count):
     result = pil_img.copy().convert("RGB")
     draw = ImageDraw.Draw(result)
     try:
@@ -141,36 +141,41 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, staves, space, flats_coun
             color = (0, 0, 255) if is_flat else (255, 0, 0)
             draw.text((b[0], b[1] - int(space * 1.6)), p_name, font=font, fill=color)
 
+    # 自動検出分の描画（削除リストに入っているものはスキップ）
     for box in auto_notes:
-        draw_label((box[0]+box[2])//2, (box[1]+box[3])//2, False)
+        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+        # 削除リストに含まれていないかチェック
+        is_deleted = False
+        for dx, dy in deleted_auto:
+            if math.hypot(cx - dx, cy - dy) < 1.0: # 同じ座標なら
+                is_deleted = True
+                break
+        if not is_deleted:
+            draw_label(cx, cy, False)
+
+    # 手動追加分の描画
     for (cx, yc) in custom_clicks:
         draw_label(cx, yc, True)
     return result
 
-@st.cache_data(show_spinner=False)
-def process_pdf_and_detect(pdf_bytes, internal_threshold):
-    imgs = convert_from_bytes(pdf_bytes)
-    data = []
-    for img in imgs:
-        staves, space = detect_staff_groups_v8(img)
-        notes = detect_note_heads_v8(np.array(img.convert('L')), space, internal_threshold, staves) if staves else []
-        data.append({"image": img, "staves": staves, "space": space, "notes": notes})
-    return data
-
 # ==========================================
 # 3. Streamlit UI
 # ==========================================
-
-st.set_page_config(page_title="ドレミ付与 V8", layout="centered")
+st.set_page_config(page_title="ドレミ付与 V8", layout="wide") # 画面を広く使う
 st.title("🎼 ドレミ付与ツール V8")
+st.info("💡 **操作方法:** 検出漏れの場所をクリックすると追加されます。すでにある音符（枠線）の近くをクリックすると削除されます。")
 
+# セッションステートの初期化（追加分と削除分）
 if "custom_clicks" not in st.session_state:
     st.session_state.custom_clicks = {}
+if "deleted_auto_notes" not in st.session_state:
+    st.session_state.deleted_auto_notes = {}
 
 st.sidebar.header("⚙️ 設定")
 flats = st.sidebar.selectbox("調号（♭）の数", range(8), index=4)
 ui_sens = st.sidebar.slider("検出感度", 1, 100, 50)
 internal_threshold = 0.85 - (ui_sens / 100.0) * 0.40
+disp_width = st.sidebar.slider("表示サイズ (px)", 400, 1500, 800) # 前回の画面サイズ調整
 
 up = st.file_uploader("PDFをアップロード", type="pdf")
 if up:
@@ -179,22 +184,56 @@ if up:
         st.write(f"### ページ {i + 1}")
         if page["staves"]:
             clicks = st.session_state.custom_clicks.get(i, [])
-            res_img = draw_all_notes(page["image"], page["notes"], clicks, page["staves"], page["space"], flats)
-            value = streamlit_image_coordinates(
-                res_img, 
-                key=f"img_{i}",
-                width=700,  # ここで表示幅を固定します（ピクセル単位）
-                use_column_width=True # または、コンテナの幅に合わせる
-            )
+            deleted_auto = st.session_state.deleted_auto_notes.get(i, [])
+            
+            res_img = draw_all_notes(page["image"], page["notes"], clicks, deleted_auto, page["staves"], page["space"], flats)
+            
+            value = streamlit_image_coordinates(res_img, key=f"img_{i}", width=disp_width)
+            
             if value:
-                new_click = (value["x"], value["y"])
-                if new_click not in clicks:
-                    if i not in st.session_state.custom_clicks: st.session_state.custom_clicks[i] = []
-                    st.session_state.custom_clicks[i].append(new_click)
-                    st.rerun()
-        else:
-            st.image(page["image"], use_column_width=True)
+                clicked_x, clicked_y = value["x"], value["y"]
+                
+                # スケール調整（表示サイズと元画像の比率を計算）
+                # widthが指定されている場合、返ってくる座標は表示サイズ基準になることがあるため、元画像スケールに戻す
+                scale = page["image"].width / disp_width
+                real_x, real_y = clicked_x * scale, clicked_y * scale
+                
+                click_threshold = page["space"] * 1.5 # これより近くをクリックしたら「削除」と判定
+                action_taken = False
 
-    if st.button("手動追加をリセット"):
+                # 1. まず「手動追加した音符」の近くをクリックしたかチェック（手動分の削除）
+                for pt in clicks.copy():
+                    if math.hypot(real_x - pt[0], real_y - pt[1]) < click_threshold:
+                        clicks.remove(pt)
+                        st.session_state.custom_clicks[i] = clicks
+                        action_taken = True
+                        break
+
+                # 2. 次に「自動検出された音符」の近くをクリックしたかチェック（自動分の削除）
+                if not action_taken:
+                    for box in page["notes"]:
+                        cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                        # 削除済みでないかチェックしつつ距離計算
+                        is_already_deleted = any(math.hypot(cx - dx, cy - dy) < 1.0 for dx, dy in deleted_auto)
+                        if not is_already_deleted and math.hypot(real_x - cx, real_y - cy) < click_threshold:
+                            if i not in st.session_state.deleted_auto_notes:
+                                st.session_state.deleted_auto_notes[i] = []
+                            st.session_state.deleted_auto_notes[i].append((cx, cy))
+                            action_taken = True
+                            break
+
+                # 3. どちらの音符の近くでもなければ「新規追加」
+                if not action_taken:
+                    if i not in st.session_state.custom_clicks: 
+                        st.session_state.custom_clicks[i] = []
+                    st.session_state.custom_clicks[i].append((real_x, real_y))
+                
+                st.rerun() # 画面を更新
+        else:
+            st.image(page["image"], width=disp_width)
+
+    # リセットボタン（追加も削除もすべて初期化）
+    if st.button("手動編集をすべてリセット"):
         st.session_state.custom_clicks = {}
+        st.session_state.deleted_auto_notes = {}
         st.rerun()
