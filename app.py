@@ -90,24 +90,43 @@ def detect_note_heads_v8(gray_img, staff_space, threshold_val, staves):
         cx, cy = x + w//2, y + h//2
         dist_to_nearest_staff = min(abs(cy - c) for c in staff_centers)
         if dist_to_nearest_staff > staff_space * 4.0: continue
-        aspect = w / float(h)
-        if not (0.8 <= aspect <= 2.2): continue
-        if not ((staff_space**2)*0.4 < w*h < (staff_space**2)*3.5): continue
         
         patch = filled[y:y+h, x:x+w]
         contours, _ = cv2.findContours(patch, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             cnt = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(cnt)
+            
+            # 極端に小さいノイズを除外
+            if area < (staff_space**2) * 0.3: continue
+            
+            # 【修正1】輪郭の正確なバウンディングボックスを取得し、アスペクト比を計算
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if bw == 0 or bh == 0: continue
+            
+            cnt_aspect = bw / float(bh)
+            if not (0.8 <= cnt_aspect <= 2.2): continue # 細長すぎるもの（連桁）を弾く
+            
             peri = cv2.arcLength(cnt, True)
-            if peri > 0 and (4.0 * np.pi * area / (peri**2)) >= 0.40:
-                raw_rects.append([x, y, x+w, y+h])
-                raw_scores.append(score)
+            if peri > 0:
+                # 【修正2】円形度を厳しく判定 (0.40 -> 0.65)
+                circularity = 4.0 * np.pi * area / (peri**2)
+                if circularity >= 0.65:
+                    
+                    # 【修正3】Solidity(凸性)のチェックを追加 (へこんだ形を弾く)
+                    hull = cv2.convexHull(cnt)
+                    hull_area = cv2.contourArea(hull)
+                    if hull_area > 0:
+                        solidity = area / float(hull_area)
+                        if solidity >= 0.85: # 音符はほぼ完全な凸型なので高い値になる
+                            raw_rects.append([x, y, x+w, y+h])
+                            raw_scores.append(score)
     
     nms_boxes = nms_v8_strict(np.array(raw_rects), np.array(raw_scores), staff_space) if raw_rects else []
     
     if len(nms_boxes) == 0: return []
 
+    # ト音記号・ヘ音記号の誤検知回避（符幹の確認ロジックはそのまま）
     final_boxes = []
     stem_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_space * 0.5))))
     stem_check_h = int(staff_space * 1.5)
@@ -152,7 +171,7 @@ def get_pitch_name(note_y, staff, clef):
     return mapping.get(steps, "")
 
 # ==========================================
-# 2. 描画処理 (和音のグループ化機能を追加・修正版)
+# 2. 描画・キャッシュ処理 
 # ==========================================
 def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, space, custom_labels, hide_boxes=False, selected_pos=None, erase_start=None):
     result = pil_img.copy().convert("RGB")
@@ -166,7 +185,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
 
     drawn_text_rects = []
 
-    # 全ての有効な音符をリストアップし、どの五線（s_idx）に属しているかを判定
     active_notes = []
     for box in auto_notes:
         cx, cy = int((box[0] + box[2]) // 2), int((box[1] + box[3]) // 2)
@@ -178,8 +196,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         s_idx = np.argmin([abs(np.mean(s) - cy) for s in staves])
         active_notes.append({"x": int(cx), "y": int(cy), "s_idx": s_idx, "is_custom": True})
 
-    # 🛑【修正箇所】五線(s_idx) ごとにソートしてから、X座標でソート
-    # これにより、右手と左手が混ざることを防ぎます
     active_notes.sort(key=lambda n: (n["s_idx"], n["x"]))
     
     groups = []
@@ -189,15 +205,13 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
         else:
             last_group = groups[-1]
             avg_x = sum(n["x"] for n in last_group) / len(last_group)
-            # 🛑【修正箇所】X座標が近く、かつ「同じ五線」の場合のみ結合する
             if abs(note["x"] - avg_x) < space * 0.8 and note["s_idx"] == last_group[0]["s_idx"]:
                 last_group.append(note)
             else:
                 groups.append([note])
 
-    # グループごとに描画
     for group in groups:
-        group.sort(key=lambda n: n["y"]) # Y座標（高い音順）でソート
+        group.sort(key=lambda n: n["y"]) 
         labels_to_draw = []
         
         for note in group:
@@ -215,7 +229,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
             if p_name:
                 labels_to_draw.append(p_name)
                 
-            # 枠線の描画
             if not hide_boxes:
                 box_color = (255, 165, 0) if is_custom else (0, 255, 0)
                 hw, hh = int(space * 0.6), int(space * 0.5)
@@ -226,7 +239,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
                 else:
                     draw.rectangle(b, outline=box_color, width=2)
 
-        # テキストの描画（和音の場合は「ソ ミ ド」のように一行にまとめて表示）
         if labels_to_draw and (not hide_boxes or any(l for l in labels_to_draw)):
             min_y = group[0]["y"]
             group_avg_x = sum(n["x"] for n in group) / len(group)
@@ -252,7 +264,6 @@ def draw_all_notes(pil_img, auto_notes, custom_clicks, deleted_auto, staves, spa
             draw.text((text_x, text_y), combined_text, font=font, fill=(255, 0, 0))
             drawn_text_rects.append((text_x, text_y, text_w, text_h))
 
-    # 範囲消去の十字線
     if erase_start and not hide_boxes:
         ex, ey = erase_start
         r = max(4, int(space * 0.4))
