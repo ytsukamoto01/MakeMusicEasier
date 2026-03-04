@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ==========================================
-# 1. 楽譜解析エンジン (V8 ロジック)
+# 1. 楽譜解析エンジン
 # ==========================================
 def detect_staff_groups_v8(pil_img):
     img_array = np.array(pil_img.convert('L'))
@@ -309,7 +309,7 @@ if "ui_sens" not in st.session_state: st.session_state.ui_sens = 50
 def next_step(): st.session_state.step += 1
 def prev_step(): st.session_state.step -= 1
 
-st.title("🎼 ドレミ付与ツール V8")
+st.title("🎼 ドレミツール")
 
 steps = ["1. アップロード", "2. ワンクリック調整", "3. マニュアル微調整", "4. プレビュー＆保存"]
 cols = st.columns(4)
